@@ -1,0 +1,1149 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import ipaddress
+import json
+import os
+import socket
+import struct
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+SOCKET_PATH=Path("/run/torrent-get-filterd.sock")
+
+STATE_DIR=Path("/var/lib/torrent-get-filter")
+DENY4_FILE=STATE_DIR/"deny4"
+DENY6_FILE=STATE_DIR/"deny6"
+GENERATION_FILE=STATE_DIR/"generation"
+
+TABLE="torrent_get"
+FAMILY="inet"
+
+CGROUP_LEVEL=5
+
+REQUEST_TIMEOUT=3.0
+RESPONSE_TIMEOUT=3.0
+MAX_REQUEST_BYTES=1024*1024
+MAX_BATCH_IPS=256
+MAX_TOTAL_IPS=4096
+
+RATE_LIMITS={
+    "read":(10.0,2.0),
+    "mutate":(4.0,1.0),
+    "sync":(1.0,0.2),
+}
+
+COMMAND_RATE_BUCKETS={
+    "status":("read",),
+    "list":("read",),
+    "activate":("mutate",),
+    "deactivate":("mutate",),
+    "sync":("mutate","sync"),
+    "block":("mutate",),
+    "unblock":("mutate",),
+    "block_many":("mutate",),
+    "unblock_many":("mutate",),
+}
+
+_filter_uid_raw=os.environ.get(
+    "TORRENT_FILTER_UID",
+    "",
+).strip()
+
+if not _filter_uid_raw.isdigit():
+    raise RuntimeError(
+        "TORRENT_FILTER_UID must be a numeric user ID"
+    )
+
+FILTER_UID=int(_filter_uid_raw)
+
+CGROUP_PATH=(
+    "user.slice/"
+    f"user-{FILTER_UID}.slice/"
+    f"user@{FILTER_UID}.service/"
+    "torrent.slice/"
+    "torrent-get.slice"
+)
+
+CHAIN="torrent_get_output"
+
+
+class RateLimiter:
+    def __init__(self,limits=None,clock=None):
+        self.limits=limits or RATE_LIMITS
+        self.clock=clock or time.monotonic
+        now=self.clock()
+        self.state={
+            name:[float(capacity),now]
+            for name,(capacity,_) in self.limits.items()
+        }
+
+    def allow(self,names):
+        now=self.clock()
+        available={}
+
+        for name in names:
+            capacity,refill=self.limits[name]
+            tokens,updated=self.state[name]
+            tokens=min(
+                float(capacity),
+                tokens+(now-updated)*float(refill),
+            )
+            available[name]=tokens
+
+        for name,tokens in available.items():
+            if tokens < 1.0:
+                _,refill=self.limits[name]
+                retry_after=(1.0-tokens)/float(refill)
+
+                for updated_name,updated_tokens in available.items():
+                    self.state[updated_name]=[updated_tokens,now]
+
+                return False,retry_after,name
+
+        for name,tokens in available.items():
+            self.state[name]=[tokens-1.0,now]
+
+        return True,0.0,""
+
+
+RATE_LIMITER=RateLimiter()
+
+
+def _gateway_log(command,result,caller_uid,reason=""):
+    record={
+        "ts":datetime.now(timezone.utc)
+            .isoformat(timespec="milliseconds")
+            .replace("+00:00","Z"),
+        "event":"FILTER_COMMAND",
+        "action":command,
+        "caller_uid":caller_uid,
+        "decision":result,
+    }
+
+    if reason:
+        record["reason"]=reason
+
+    print(
+        "TG_GATE\t"+json.dumps(
+            record,
+            separators=(",",":"),
+            sort_keys=True,
+        ),
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def nft_script(script: str):
+    cp=subprocess.run(
+        ["/usr/sbin/nft","-f","-"],
+        input=script,
+        text=True,
+        capture_output=True,
+    )
+
+    if cp.returncode != 0:
+        raise RuntimeError(
+            cp.stderr.strip()
+            or "nft transaction failed"
+        )
+
+
+def nft_exists(*args):
+    return subprocess.run(
+        ["/usr/sbin/nft","list",*args],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    ).returncode == 0
+
+
+def ensure_schema():
+    if not nft_exists("table",FAMILY,TABLE):
+        nft_script(
+            f"add table {FAMILY} {TABLE}\n"
+        )
+
+    if not nft_exists("set",FAMILY,TABLE,"deny4"):
+        nft_script(
+            f"add set {FAMILY} {TABLE} deny4 "
+            "{ type ipv4_addr; flags interval; }\n"
+        )
+
+    if not nft_exists("set",FAMILY,TABLE,"deny6"):
+        nft_script(
+            f"add set {FAMILY} {TABLE} deny6 "
+            "{ type ipv6_addr; flags interval; }\n"
+        )
+
+
+def _ordered(values):
+    return sorted(
+        set(values),
+        key=lambda value:
+            int(ipaddress.ip_address(value)),
+    )
+
+
+def _canonical(raw):
+    return str(
+        ipaddress.ip_address(
+            str(raw).strip()
+        )
+    )
+
+
+def _normalize_ips(ips,limit,limit_name="batch"):
+    if not isinstance(ips,list):
+        raise ValueError(
+            "ips must be a list"
+        )
+
+    if len(ips)>limit:
+        raise ValueError(
+            f"{limit_name} limit exceeded: maximum {limit} IPs"
+        )
+
+    requested=[]
+    requested4=set()
+    requested6=set()
+
+    for raw in ips:
+        address=ipaddress.ip_address(
+            str(raw).strip()
+        )
+        value=str(address)
+        target=(
+            requested4
+            if address.version==4
+            else requested6
+        )
+
+        if value in target:
+            continue
+
+        target.add(value)
+        requested.append(value)
+
+    return requested,requested4,requested6
+
+
+def _read_lines(path):
+    try:
+        raw=path.read_text().splitlines()
+    except FileNotFoundError:
+        return []
+
+    values=[]
+
+    for line in raw:
+        line=line.strip()
+
+        if not line:
+            continue
+
+        values.append(
+            _canonical(line)
+        )
+
+    return values
+
+
+def load_state():
+    v4=[]
+    v6=[]
+
+    for value in _read_lines(DENY4_FILE):
+        if ipaddress.ip_address(value).version != 4:
+            raise RuntimeError(
+                "non-IPv4 address in deny4"
+            )
+
+        v4.append(value)
+
+    for value in _read_lines(DENY6_FILE):
+        if ipaddress.ip_address(value).version != 6:
+            raise RuntimeError(
+                "non-IPv6 address in deny6"
+            )
+
+        v6.append(value)
+
+    try:
+        generation=int(
+            GENERATION_FILE.read_text().strip()
+            or "0"
+        )
+    except FileNotFoundError:
+        generation=0
+
+    return (
+        _ordered(v4),
+        _ordered(v6),
+        generation,
+    )
+
+
+def _sync_state_dir():
+    dfd=os.open(
+        STATE_DIR,
+        os.O_RDONLY
+        | getattr(os,"O_DIRECTORY",0),
+    )
+
+    try:
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
+
+
+def _atomic_lines(path,values,sync_directory=True):
+    STATE_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+        mode=0o700,
+    )
+
+    os.chmod(STATE_DIR,0o700)
+
+    tmp=path.with_name(
+        "."+path.name+".tmp"
+    )
+
+    with tmp.open("w") as handle:
+        for value in values:
+            handle.write(value+"\n")
+
+        handle.flush()
+        os.fsync(handle.fileno())
+
+    os.chmod(tmp,0o600)
+    os.replace(tmp,path)
+
+    if sync_directory:
+        _sync_state_dir()
+
+
+def persist_state(v4,v6,generation):
+    _atomic_lines(
+        DENY4_FILE,
+        _ordered(v4),
+        sync_directory=False,
+    )
+
+    _atomic_lines(
+        DENY6_FILE,
+        _ordered(v6),
+        sync_directory=False,
+    )
+
+    _atomic_lines(
+        GENERATION_FILE,
+        [str(int(generation))],
+        sync_directory=False,
+    )
+
+    _sync_state_dir()
+
+
+def _append_lines(path,values):
+    ordered=_ordered(values)
+
+    if not ordered:
+        return
+
+    STATE_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+        mode=0o700,
+    )
+    os.chmod(STATE_DIR,0o700)
+
+    with path.open("a") as handle:
+        for value in ordered:
+            handle.write(value+"\n")
+
+        handle.flush()
+        os.fsync(handle.fileno())
+
+    os.chmod(path,0o600)
+
+
+def persist_mutation(v4,v6,generation,change4,change6,blocked):
+    """Persist only families changed by one incremental nft transaction."""
+    if blocked:
+        _append_lines(DENY4_FILE,change4)
+        _append_lines(DENY6_FILE,change6)
+    else:
+        if change4:
+            _atomic_lines(
+                DENY4_FILE,
+                _ordered(v4),
+                sync_directory=False,
+            )
+
+        if change6:
+            _atomic_lines(
+                DENY6_FILE,
+                _ordered(v6),
+                sync_directory=False,
+            )
+
+    _atomic_lines(
+        GENERATION_FILE,
+        [str(int(generation))],
+        sync_directory=False,
+    )
+    _sync_state_dir()
+
+
+def kernel_counts():
+    cp=subprocess.run(
+        [
+            "/usr/sbin/nft",
+            "-j",
+            "list",
+            "table",
+            FAMILY,
+            TABLE,
+        ],
+        text=True,
+        capture_output=True,
+    )
+
+    if cp.returncode != 0:
+        return 0,0
+
+    try:
+        data=json.loads(cp.stdout)
+    except Exception:
+        return 0,0
+
+    v4=0
+    v6=0
+
+    for item in data.get("nftables",[]):
+        node=item.get("set")
+
+        if not isinstance(node,dict):
+            continue
+
+        name=node.get("name")
+        elem=node.get("elem",[])
+
+        if name=="deny4":
+            v4=len(elem)
+
+        elif name=="deny6":
+            v6=len(elem)
+
+    return v4,v6
+
+
+def kernel_state():
+    cp=subprocess.run(
+        [
+            "/usr/sbin/nft",
+            "-j",
+            "list",
+            "table",
+            FAMILY,
+            TABLE,
+        ],
+        text=True,
+        capture_output=True,
+    )
+
+    if cp.returncode != 0:
+        raise RuntimeError(
+            cp.stderr.strip()
+            or "unable to read nft state"
+        )
+
+    try:
+        data=json.loads(cp.stdout)
+    except Exception as exc:
+        raise RuntimeError(
+            "invalid nft state response"
+        ) from exc
+
+    sets={
+        "deny4":set(),
+        "deny6":set(),
+    }
+    found=set()
+    chain_found=False
+    v4_rule=False
+    v6_rule=False
+
+    for item in data.get("nftables",[]):
+        node=item.get("set")
+
+        if isinstance(node,dict):
+            name=node.get("name")
+
+            if name in sets:
+                found.add(name)
+
+                for raw in node.get("elem",[]):
+                    if not isinstance(raw,str):
+                        raise RuntimeError(
+                            f"unsupported nft element in {name}"
+                        )
+
+                    value=_canonical(raw)
+                    version=ipaddress.ip_address(value).version
+
+                    if (
+                        name=="deny4" and version != 4
+                        or name=="deny6" and version != 6
+                    ):
+                        raise RuntimeError(
+                            f"wrong address family in {name}"
+                        )
+
+                    sets[name].add(value)
+
+        chain=item.get("chain")
+
+        if (
+            isinstance(chain,dict)
+            and chain.get("name")==CHAIN
+            and chain.get("hook")=="output"
+        ):
+            chain_found=True
+
+        rule=item.get("rule")
+
+        if not isinstance(rule,dict) or rule.get("chain") != CHAIN:
+            continue
+
+        rendered=json.dumps(rule,sort_keys=True)
+        v4_rule=v4_rule or "deny4" in rendered
+        v6_rule=v6_rule or "deny6" in rendered
+
+    missing={"deny4","deny6"}-found
+
+    if missing:
+        raise RuntimeError(
+            "missing nft set(s): "+", ".join(sorted(missing))
+        )
+
+    return (
+        sets["deny4"],
+        sets["deny6"],
+        chain_found and v4_rule and v6_rule,
+    )
+
+
+def apply_snapshot(v4,v6):
+    ensure_schema()
+
+    lines=[
+        f"flush set {FAMILY} {TABLE} deny4",
+        f"flush set {FAMILY} {TABLE} deny6",
+    ]
+
+    if v4:
+        lines.append(
+            f"add element {FAMILY} {TABLE} deny4 "
+            "{ "+", ".join(v4)+" }"
+        )
+
+    if v6:
+        lines.append(
+            f"add element {FAMILY} {TABLE} deny6 "
+            "{ "+", ".join(v6)+" }"
+        )
+
+    nft_script(
+        "\n".join(lines)+"\n"
+    )
+
+    kv4,kv6=kernel_counts()
+
+    if kv4 != len(v4) or kv6 != len(v6):
+        raise RuntimeError(
+            "kernel-set verification failed: "
+            f"expected {len(v4)}/{len(v6)}, "
+            f"got {kv4}/{kv6}"
+        )
+
+
+def enforcement_status():
+    cp=subprocess.run(
+        [
+            "/usr/sbin/nft",
+            "-j",
+            "list",
+            "table",
+            FAMILY,
+            TABLE,
+        ],
+        text=True,
+        capture_output=True,
+    )
+
+    if cp.returncode != 0:
+        return False
+
+    try:
+        data=json.loads(cp.stdout)
+    except Exception:
+        return False
+
+    chain_found=False
+    v4_rule=False
+    v6_rule=False
+
+    for item in data.get("nftables",[]):
+        chain=item.get("chain")
+
+        if (
+            isinstance(chain,dict)
+            and chain.get("name")==CHAIN
+            and chain.get("hook")=="output"
+        ):
+            chain_found=True
+
+        rule=item.get("rule")
+
+        if not isinstance(rule,dict):
+            continue
+
+        if rule.get("chain") != CHAIN:
+            continue
+
+        rendered=json.dumps(
+            rule,
+            sort_keys=True,
+        )
+
+        if "deny4" in rendered:
+            v4_rule=True
+
+        if "deny6" in rendered:
+            v6_rule=True
+
+    return (
+        chain_found
+        and v4_rule
+        and v6_rule
+    )
+
+
+def activate_enforcement():
+    v4,v6=kernel_counts()
+
+    if v4+v6 == 0:
+        raise RuntimeError(
+            "refusing activation: deny sets are empty"
+        )
+
+    subprocess.run(
+        [
+            "/usr/sbin/nft",
+            "delete",
+            "chain",
+            FAMILY,
+            TABLE,
+            CHAIN,
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    nft_script(
+        f"""
+add chain {FAMILY} {TABLE} {CHAIN} {{ type filter hook output priority filter; policy accept; }}
+add rule {FAMILY} {TABLE} {CHAIN} socket cgroupv2 level {CGROUP_LEVEL} "{CGROUP_PATH}" ip daddr @deny4 drop
+add rule {FAMILY} {TABLE} {CHAIN} socket cgroupv2 level {CGROUP_LEVEL} "{CGROUP_PATH}" ip6 daddr @deny6 drop
+"""
+    )
+
+    if not enforcement_status():
+        raise RuntimeError(
+            "kernel enforcement verification failed"
+        )
+
+
+def deactivate_enforcement():
+    subprocess.run(
+        [
+            "/usr/sbin/nft",
+            "delete",
+            "chain",
+            FAMILY,
+            TABLE,
+            CHAIN,
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    if enforcement_status():
+        raise RuntimeError(
+            "enforcement chain remains active"
+        )
+
+
+def state_reply():
+    v4,v6,generation=load_state()
+    kv4,kv6=kernel_counts()
+
+    return {
+        "ok":True,
+        "backend":
+            "nft"
+            if enforcement_status()
+            else "nft-shadow",
+        "generation":generation,
+        "ipv4":kv4,
+        "ipv6":kv6,
+        "blocked":len(v4)+len(v6),
+        "enforcing":enforcement_status(),
+    }
+
+
+def sync_snapshot(generation,ips):
+    _,set4,set6=_normalize_ips(
+        ips,
+        MAX_TOTAL_IPS,
+        "total blocked-IP",
+    )
+    v4=_ordered(set4)
+    v6=_ordered(set6)
+
+    apply_snapshot(v4,v6)
+    persist_state(
+        v4,
+        v6,
+        int(generation),
+    )
+
+    return state_reply()
+
+
+def mutate(ip,blocked):
+    reply=mutate_many([ip],blocked)
+    value=reply.pop("requested")[0]
+    changed_values=reply.pop("changed")
+    reply.pop("unchanged")
+    reply["ip"]=value
+    reply["changed"]=bool(changed_values)
+
+    return reply
+
+
+def mutate_many(ips,blocked):
+    """
+    Apply one permanent-filter transaction for many addresses.
+
+    One state load.
+    One generation change.
+    One nft state read and one batched nft mutation when needed.
+    One persistent-state commit.
+    """
+    canonical,requested4,requested6=_normalize_ips(
+        ips,
+        MAX_BATCH_IPS,
+    )
+
+    # The daemon is deliberately single-threaded, so this read/compare/write
+    # sequence remains the existing narrow serialization boundary.
+    disk4,disk6,generation=load_state()
+    set4,set6,enforcing=kernel_state()
+
+    if set4 != set(disk4) or set6 != set(disk6):
+        raise RuntimeError(
+            "persistent and nft set state differ"
+        )
+
+    if blocked:
+        change4=requested4-set4
+        change6=requested6-set6
+    else:
+        change4=requested4&set4
+        change6=requested6&set6
+
+    changed_set=change4|change6
+    changed=[
+        value for value in canonical
+        if value in changed_set
+    ]
+    unchanged=[
+        value for value in canonical
+        if value not in changed_set
+    ]
+
+    next4=(set4|change4) if blocked else (set4-change4)
+    next6=(set6|change6) if blocked else (set6-change6)
+
+    if blocked and len(next4)+len(next6)>MAX_TOTAL_IPS:
+        raise ValueError(
+            f"total blocked-IP limit exceeded: maximum {MAX_TOTAL_IPS} IPs"
+        )
+
+    if changed:
+        generation+=1
+        action="add" if blocked else "delete"
+        lines=[]
+
+        if change4:
+            lines.append(
+                f"{action} element {FAMILY} {TABLE} deny4 "
+                "{ "+", ".join(_ordered(change4))+" }"
+            )
+
+        if change6:
+            lines.append(
+                f"{action} element {FAMILY} {TABLE} deny6 "
+                "{ "+", ".join(_ordered(change6))+" }"
+            )
+
+        nft_script("\n".join(lines)+"\n")
+
+        persist_mutation(
+            next4,
+            next6,
+            generation,
+            change4,
+            change6,
+            blocked,
+        )
+
+    return {
+        "ok":True,
+        "backend":"nft" if enforcing else "nft-shadow",
+        "generation":generation,
+        "ipv4":len(next4),
+        "ipv6":len(next6),
+        "blocked":len(next4)+len(next6),
+        "enforcing":enforcing,
+        "changed":changed,
+        "unchanged":unchanged,
+        "requested":canonical,
+    }
+
+
+def list_state():
+    v4,v6,generation=load_state()
+
+    return {
+        "ok":True,
+        "generation":generation,
+        "ipv4":len(v4),
+        "ipv6":len(v6),
+        "blocked":len(v4)+len(v6),
+        "ips":v4+v6,
+        "enforcing":enforcement_status(),
+    }
+
+
+def handle(request,caller_uid=FILTER_UID):
+    command=str(
+        request.get("cmd","")
+    ).casefold()
+
+    buckets=COMMAND_RATE_BUCKETS.get(command)
+
+    if buckets:
+        allowed,retry_after,bucket=RATE_LIMITER.allow(
+            buckets
+        )
+
+        if not allowed:
+            _gateway_log(
+                command,
+                "DENY",
+                caller_uid,
+                "rate_limited",
+            )
+
+            return {
+                "ok":False,
+                "error":"rate_limited",
+                "retry_after":round(retry_after,3),
+                "rate_class":bucket,
+            }
+
+        _gateway_log(
+            command,
+            "ALLOW",
+            caller_uid,
+        )
+
+    if command=="status":
+        return state_reply()
+
+    if command=="list":
+        return list_state()
+
+    if command=="activate":
+        activate_enforcement()
+        return state_reply()
+
+    if command=="deactivate":
+        deactivate_enforcement()
+        return state_reply()
+
+    if command=="sync":
+        return sync_snapshot(
+            request.get("generation",0),
+            request.get("ips",[]),
+        )
+
+    if command=="block":
+        return mutate(
+            request.get("ip",""),
+            True,
+        )
+
+    if command=="unblock":
+        return mutate(
+            request.get("ip",""),
+            False,
+        )
+
+    if command=="block_many":
+        return mutate_many(
+            request.get("ips",[]),
+            True,
+        )
+
+    if command=="unblock_many":
+        return mutate_many(
+            request.get("ips",[]),
+            False,
+        )
+
+    return {
+        "ok":False,
+        "error":"unsupported command",
+    }
+
+
+def startup():
+    STATE_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+        mode=0o700,
+    )
+
+    os.chmod(STATE_DIR,0o700)
+
+    ensure_schema()
+
+    v4,v6,_=load_state()
+
+    if v4 or v6:
+        apply_snapshot(v4,v6)
+
+        try:
+            activate_enforcement()
+        except Exception:
+            # Sets remain restored even if the user cgroup
+            # does not yet exist. Activation can be retried.
+            pass
+
+
+class RequestReadError(Exception):
+    pass
+
+
+def receive_request(conn):
+    deadline=time.monotonic()+REQUEST_TIMEOUT
+    raw=bytearray()
+
+    while True:
+        remaining=deadline-time.monotonic()
+
+        if remaining <= 0:
+            raise RequestReadError(
+                "request deadline exceeded"
+            )
+
+        conn.settimeout(remaining)
+
+        try:
+            block=conn.recv(
+                min(
+                    65536,
+                    MAX_REQUEST_BYTES+1-len(raw),
+                )
+            )
+        except socket.timeout as exc:
+            raise RequestReadError(
+                "request deadline exceeded"
+            ) from exc
+
+        if not block:
+            raise RequestReadError(
+                "incomplete request"
+            )
+
+        raw.extend(block)
+
+        if len(raw) > MAX_REQUEST_BYTES:
+            raise RequestReadError(
+                "request too large"
+            )
+
+        newline=raw.find(b"\n")
+
+        if newline >= 0:
+            if raw[newline+1:].strip():
+                raise RequestReadError(
+                    "trailing request data"
+                )
+
+            return bytes(raw[:newline])
+
+
+def main():
+    startup()
+
+    # If boot-time activation failed because the torrent cgroup did
+    # not yet exist, retry only that startup activation until it
+    # succeeds. A later explicit deactivate remains authoritative.
+    kv4,kv6=kernel_counts()
+
+    retry_startup_activation=(
+        kv4+kv6 > 0
+        and not enforcement_status()
+    )
+
+    try:
+        SOCKET_PATH.unlink()
+    except FileNotFoundError:
+        pass
+
+    sock=socket.socket(
+        socket.AF_UNIX,
+        socket.SOCK_STREAM,
+    )
+
+    sock.bind(
+        str(SOCKET_PATH)
+    )
+
+    uid=int(
+        os.environ.get(
+            "TORRENT_FILTER_UID",
+            "1000",
+        )
+    )
+
+    # Set mode while the daemon still owns the socket.
+    # After chown(), this capability-restricted service no longer
+    # has CAP_FOWNER and therefore cannot chmod the user-owned inode.
+    os.chmod(
+        SOCKET_PATH,
+        0o600,
+    )
+
+    os.chown(
+        SOCKET_PATH,
+        uid,
+        -1,
+    )
+
+    sock.listen(8)
+    sock.settimeout(5.0)
+
+    while True:
+        if retry_startup_activation:
+            if enforcement_status():
+                retry_startup_activation=False
+            else:
+                try:
+                    activate_enforcement()
+                except Exception:
+                    pass
+                else:
+                    retry_startup_activation=False
+
+        try:
+            conn,_=sock.accept()
+        except socket.timeout:
+            continue
+
+        with conn:
+            peer_uid=-1
+
+            try:
+                _,peer_uid,_=struct.unpack(
+                    "3i",
+                    conn.getsockopt(
+                        socket.SOL_SOCKET,
+                        socket.SO_PEERCRED,
+                        struct.calcsize("3i"),
+                    ),
+                )
+            except (AttributeError,OSError,struct.error):
+                pass
+
+            try:
+                raw=receive_request(conn)
+
+            except RequestReadError:
+                # Do not let an incomplete, oversized, or slow request
+                # extend its connection lifetime by blocking on an error
+                # response.
+                continue
+
+            try:
+                request=json.loads(
+                    raw.decode()
+                )
+
+                if not isinstance(request,dict):
+                    raise ValueError(
+                        "request must be an object"
+                    )
+
+                response=handle(
+                    request,
+                    peer_uid,
+                )
+
+            except Exception as exc:
+                response={
+                    "ok":False,
+                    "error":
+                        f"{type(exc).__name__}: {exc}",
+                }
+
+            try:
+                conn.settimeout(
+                    RESPONSE_TIMEOUT
+                )
+
+                conn.sendall(
+                    (
+                        json.dumps(
+                            response,
+                            separators=(",",":"),
+                            sort_keys=True,
+                        )
+                        + "\n"
+                    ).encode()
+                )
+
+            except (
+                BrokenPipeError,
+                ConnectionResetError,
+                socket.timeout,
+            ):
+                # The transaction is already complete.
+                # A disconnected client is not a daemon failure.
+                pass
+
+
+if __name__=="__main__":
+    main()

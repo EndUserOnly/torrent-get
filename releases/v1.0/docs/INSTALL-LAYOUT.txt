@@ -1,0 +1,18 @@
+User executables:     ~/.local/bin
+User helpers:         ~/.local/libexec
+Security modules:     ~/.local/lib/torrent-get/security
+GeoIP database:       ~/.local/share/torrent-get/geoip/GeoLite2-Country.mmdb
+User service units:   ~/.config/systemd/user
+System filter helper: /usr/local/libexec/torrent-get-filterd
+System service unit:  /etc/systemd/system/torrent-get-filterd.service
+Jackett application:  /opt/Jackett
+Jackett service unit: /etc/systemd/system/jackett.service
+
+The installer copies the frozen files to these locations. It does not invoke
+systemctl itself. Run activate-services.sh after installation to reload the unit
+definitions and enable/start the existing filter backend, control socket, and
+rate regulator. The script does not create additional workers or services.
+
+Jackett v0.24.2527 is installed from the bundled, hash-verified official archive
+only when Jackett is absent. Jackett configuration and API keys remain outside
+the package.

@@ -1,0 +1,25 @@
+[Unit]
+Description=torrent-get permanent filter backend
+After=network.target
+
+[Service]
+Type=simple
+Environment=TORRENT_FILTER_UID=1000
+ExecStart=/usr/local/libexec/torrent-get-filterd
+Restart=on-failure
+RestartSec=1
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=no
+ProtectSystem=strict
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_CHOWN
+AmbientCapabilities=CAP_NET_ADMIN CAP_CHOWN
+ReadWritePaths=/run /var/lib/torrent-get-filter
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,561 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import json
+import os
+import socket
+import time
+from pathlib import Path
+
+
+HOME=Path.home()
+
+QUEUE=HOME/".local/share/torrent-queue/jobs.json"
+RATES=HOME/".local/share/torrent-get/rate-limits.json"
+
+RUNTIME=Path(f"/run/user/{os.getuid()}/torrent-get")
+
+# A worker that is not currently transferring still needs a small
+# controlled allowance so that it can become active.
+#
+# This allowance is reclaimed dynamically as active workers emerge.
+PROBE=64*1024
+
+# Below this rate a worker is treated as effectively idle for allocation.
+ACTIVE_THRESHOLD=8*1024
+
+INTERVAL=2.0
+
+
+def load(path,default):
+    try:
+        data=json.loads(path.read_text())
+        return data if isinstance(data,dict) else default
+    except Exception:
+        return default
+
+
+def query(job,command,timeout=1.0):
+    jid=int(job["id"])
+    pid=int(job.get("pid") or 0)
+    path=Path(f"/run/user/{os.getuid()}/torrent-control.sock")
+
+    try:
+        with socket.socket(
+            socket.AF_UNIX,
+            socket.SOCK_STREAM
+        ) as s:
+            s.settimeout(timeout+1.0)
+            s.connect(str(path))
+            s.sendall((json.dumps({
+                "job_id":jid,
+                "pid":pid,
+                "command":command,
+                "timeout":timeout,
+            },separators=(",",":"))+"\n").encode())
+
+            raw=b""
+
+            while True:
+                block=s.recv(65536)
+
+                if not block:
+                    break
+
+                raw+=block
+
+            return raw.decode(errors="replace")
+
+    except (OSError,TimeoutError):
+        return None
+
+
+def status(job):
+    raw=query(job,"STATUS")
+
+    if not raw:
+        return {
+            "down":0,
+            "up":0,
+        }
+
+    parts=raw.strip().split("\t")
+
+    try:
+        if len(parts)>=9 and parts[0]=="STATUS":
+            return {
+                "down":max(0,int(parts[4] or 0)),
+                "up":max(0,int(parts[5] or 0)),
+            }
+    except (TypeError,ValueError):
+        pass
+
+    return {
+        "down":0,
+        "up":0,
+    }
+
+
+def active_limits(job):
+    raw=query(job,"LIMITS")
+
+    if not raw:
+        return 0,0
+
+    parts=raw.strip().split("\t")
+
+    try:
+        if len(parts)==3 and parts[0]=="LIMITS":
+            return (
+                max(0,int(parts[1] or 0)),
+                max(0,int(parts[2] or 0)),
+            )
+    except (TypeError,ValueError):
+        pass
+
+    return 0,0
+
+
+def personal_limit(rates,jid,direction):
+    rec=rates.get(
+        "jobs",{}
+    ).get(
+        str(int(jid)),
+        {}
+    )
+
+    try:
+        return max(
+            0,
+            int(rec.get(direction,0) or 0)
+        )
+    except (TypeError,ValueError):
+        return 0
+
+
+def distribute_global(
+    jobs,
+    measured,
+    rates,
+    direction,
+    global_limit,
+):
+    """
+    Return {job_id: worker_limit}.
+
+    When global_limit > 0:
+      * every worker remains capped
+      * sum(worker limits) <= global limit
+      * idle workers receive only a small probe allowance
+      * active workers share all remaining capacity
+      * unused capacity is therefore not stranded on idle workers
+      * personal limits remain hard ceilings
+
+    Worker limit 0 means unlimited, therefore ZERO is never assigned
+    while a global ceiling is active.
+    """
+
+    jids=[
+        int(job["id"])
+        for job in jobs
+    ]
+
+    if not jids:
+        return {}
+
+    if global_limit<=0:
+        return {
+            jid:personal_limit(
+                rates,
+                jid,
+                direction
+            )
+            for jid in jids
+        }
+
+    # If the global ceiling is extremely small, divide every byte fairly.
+    if global_limit < len(jids):
+        result={}
+        remaining=global_limit
+
+        for i,jid in enumerate(jids):
+            slots=len(jids)-i
+
+            value=max(
+                1,
+                remaining//slots
+            )
+
+            result[jid]=value
+            remaining-=value
+
+        return result
+
+    # Base allowance for every worker.
+    floor=min(
+        PROBE,
+        max(
+            1,
+            global_limit//max(1,len(jids)*4)
+        )
+    )
+
+    allocation={}
+
+    for jid in jids:
+        personal=personal_limit(
+            rates,
+            jid,
+            direction
+        )
+
+        base=floor
+
+        if personal:
+            base=min(
+                base,
+                personal
+            )
+
+        allocation[jid]=max(
+            1,
+            base
+        )
+
+    # If base allowances consume too much, fair-share the ceiling.
+    base_total=sum(allocation.values())
+
+    if base_total>=global_limit:
+        result={}
+        remaining=global_limit
+
+        for i,jid in enumerate(jids):
+            slots=len(jids)-i
+            value=max(
+                1,
+                remaining//slots
+            )
+
+            personal=personal_limit(
+                rates,
+                jid,
+                direction
+            )
+
+            if personal:
+                value=min(
+                    value,
+                    personal
+                )
+
+            result[jid]=value
+            remaining-=value
+
+        return result
+
+    remaining=global_limit-base_total
+
+    # Workers already transferring get the reclaimable bandwidth.
+    active=[
+        jid
+        for jid in jids
+        if measured.get(jid,{}).get(direction,0)
+        >= ACTIVE_THRESHOLD
+    ]
+
+    # When nothing is active yet, all workers may probe equally.
+    if not active:
+        active=list(jids)
+
+    eligible=set(active)
+
+    # Weighted water-fill. Current throughput is merely a demand signal;
+    # it does NOT become a hard allocation ceiling.
+    while remaining>0 and eligible:
+        weights={
+            jid:max(
+                PROBE,
+                measured.get(jid,{}).get(direction,0)
+            )
+            for jid in eligible
+        }
+
+        total_weight=sum(weights.values())
+
+        if total_weight<=0:
+            total_weight=len(eligible)
+            weights={
+                jid:1
+                for jid in eligible
+            }
+
+        progress=0
+
+        for jid in list(eligible):
+            if remaining<=0:
+                break
+
+            share=max(
+                1,
+                int(
+                    remaining
+                    * weights[jid]
+                    / total_weight
+                )
+            )
+
+            personal=personal_limit(
+                rates,
+                jid,
+                direction
+            )
+
+            if personal:
+                room=max(
+                    0,
+                    personal-allocation[jid]
+                )
+            else:
+                room=remaining
+
+            add=min(
+                share,
+                room,
+                remaining
+            )
+
+            if add>0:
+                allocation[jid]+=add
+                remaining-=add
+                progress+=add
+
+            if personal and allocation[jid]>=personal:
+                eligible.discard(jid)
+
+        if progress==0:
+            break
+
+    # Any rounding remainder goes to eligible jobs without violating
+    # personal ceilings.
+    if remaining>0:
+        for jid in jids:
+            if remaining<=0:
+                break
+
+            personal=personal_limit(
+                rates,
+                jid,
+                direction
+            )
+
+            room=(
+                max(0,personal-allocation[jid])
+                if personal
+                else remaining
+            )
+
+            add=min(
+                room,
+                remaining
+            )
+
+            allocation[jid]+=add
+            remaining-=add
+
+    # Hard invariant.
+    total=sum(allocation.values())
+
+    if total>global_limit:
+        raise RuntimeError(
+            f"allocator invariant violated: "
+            f"{total}>{global_limit}"
+        )
+
+    return allocation
+
+
+def send_limit(job,direction,value):
+    command=(
+        f"LIMIT DOWN {int(value)}"
+        if direction=="down"
+        else f"LIMIT UP {int(value)}"
+    )
+
+    raw=query(
+        job,
+        command
+    )
+
+    if not raw:
+        return False
+
+    expected=(
+        "OK\tLIMIT\tDOWN\t"
+        if direction=="down"
+        else "OK\tLIMIT\tUP\t"
+    )
+
+    return raw.startswith(expected)
+
+
+def apply_direction(
+    jobs,
+    old,
+    desired,
+    direction,
+):
+    """
+    Reallocation is applied safely:
+
+      1. decreases first
+      2. increases second
+
+    This avoids temporarily raising the aggregate worker ceilings above
+    the configured global ceiling during redistribution.
+    """
+
+    index={
+        int(job["id"]):job
+        for job in jobs
+    }
+
+    # Decreases first.
+    for jid,new_value in desired.items():
+        old_value=old.get(jid,0)
+
+        if old_value and new_value < old_value:
+            send_limit(
+                index[jid],
+                direction,
+                new_value
+            )
+
+    # Then unchanged/unknown/increases.
+    for jid,new_value in desired.items():
+        old_value=old.get(jid,0)
+
+        if old_value and new_value < old_value:
+            continue
+
+        if old_value==new_value:
+            continue
+
+        send_limit(
+            index[jid],
+            direction,
+            new_value
+        )
+
+
+def regulate_once():
+    queue=load(
+        QUEUE,
+        {"jobs":[]}
+    )
+
+    rates=load(
+        RATES,
+        {
+            "global":{
+                "down":0,
+                "up":0,
+            },
+            "jobs":{},
+        }
+    )
+
+    jobs=[
+        job
+        for job in queue.get("jobs",[])
+        if job.get("state")=="RUNNING"
+        and job.get("pid") is not None
+    ]
+
+    if not jobs:
+        return
+
+    measured={}
+    old_down={}
+    old_up={}
+
+    for job in jobs:
+        jid=int(job["id"])
+
+        measured[jid]=status(job)
+
+        down,up=active_limits(job)
+
+        old_down[jid]=down
+        old_up[jid]=up
+
+    try:
+        global_down=max(
+            0,
+            int(
+                rates.get(
+                    "global",{}
+                ).get("down",0)
+                or 0
+            )
+        )
+    except (TypeError,ValueError):
+        global_down=0
+
+    try:
+        global_up=max(
+            0,
+            int(
+                rates.get(
+                    "global",{}
+                ).get("up",0)
+                or 0
+            )
+        )
+    except (TypeError,ValueError):
+        global_up=0
+
+    desired_down=distribute_global(
+        jobs,
+        measured,
+        rates,
+        "down",
+        global_down,
+    )
+
+    desired_up=distribute_global(
+        jobs,
+        measured,
+        rates,
+        "up",
+        global_up,
+    )
+
+    apply_direction(
+        jobs,
+        old_down,
+        desired_down,
+        "down",
+    )
+
+    apply_direction(
+        jobs,
+        old_up,
+        desired_up,
+        "up",
+    )
+
+
+def main():
+    while True:
+        try:
+            regulate_once()
+        except Exception:
+            # A regulator failure must never terminate torrent workers.
+            pass
+
+        time.sleep(INTERVAL)
+
+
+if __name__=="__main__":
+    main()

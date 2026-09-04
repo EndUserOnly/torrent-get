@@ -1,0 +1,2837 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+import sys
+import subprocess
+
+import time
+import shutil
+import argparse
+import json
+import os
+import socket
+import ipaddress
+from pathlib import Path
+import re
+
+HOME = Path.home()
+STATE_FILE = HOME / ".local" / "share" / "torrent-queue" / "jobs.json"
+MGMNT = HOME / ".local" / "bin" / "torrent-mgmnt"
+
+
+
+# =========================================================
+def wire_mode():
+    return (
+        os.environ.get(
+            "TORRENT_PEERS_TRAFFIC",
+            "payload"
+        ).casefold()
+        == "wire"
+    )
+
+
+
+def payload_peer_mode():
+    env=os.environ.copy()
+    env["TORRENT_PEERS_TRAFFIC"]="payload"
+
+    os.execvpe(
+        sys.executable,
+        [sys.executable] + sys.argv,
+        env
+    )
+
+
+def toggle_wire_mode():
+    env=os.environ.copy()
+
+    if wire_mode():
+        env["TORRENT_PEERS_TRAFFIC"]="payload"
+    else:
+        env["TORRENT_PEERS_TRAFFIC"]="wire"
+
+    os.execvpe(
+        sys.executable,
+        [sys.executable] + sys.argv,
+        env
+    )
+
+
+def human_rate(n: int) -> str:
+    value = float(max(0, n))
+    units = ["B/s", "KiB/s", "MiB/s", "GiB/s", "TiB/s"]
+    unit = 0
+    while value >= 1024.0 and unit < len(units) - 1:
+        value /= 1024.0
+        unit += 1
+    return f"{value:.0f} {units[unit]}" if unit == 0 else f"{value:.1f} {units[unit]}"
+
+
+def human_size(n: int) -> str:
+    value = float(max(0, n))
+    units = ["B", "KiB", "MiB", "GiB", "TiB"]
+    unit = 0
+    while value >= 1024.0 and unit < len(units) - 1:
+        value /= 1024.0
+        unit += 1
+    return f"{value:.0f} {units[unit]}" if unit == 0 else f"{value:.1f} {units[unit]}"
+
+
+def find_maxmind_db() -> Path | None:
+    """Locate an existing local MaxMind database. No network access."""
+    env = os.environ.get("TORRENT_GEOIP_DB")
+    candidates = []
+    if env:
+        candidates.append(Path(env).expanduser())
+
+    candidates += [
+        HOME / ".local/share/torrent-get/geoip/GeoLite2-Country.mmdb",
+        HOME / ".local/share/torrent-get/geoip/GeoLite2-City.mmdb",
+        HOME / ".local/share/GeoIP/GeoLite2-Country.mmdb",
+        HOME / ".local/share/GeoIP/GeoLite2-City.mmdb",
+        HOME / ".local/share/torrent-cli/GeoLite2-Country.mmdb",
+        HOME / ".local/share/torrent-cli/GeoLite2-City.mmdb",
+        HOME / ".config/torrent-cli/GeoLite2-Country.mmdb",
+        HOME / ".config/torrent-cli/GeoLite2-City.mmdb",
+        HOME / "GeoIP/GeoLite2-Country.mmdb",
+        HOME / "GeoIP/GeoLite2-City.mmdb",
+        Path("/usr/share/GeoIP/GeoLite2-Country.mmdb"),
+        Path("/usr/share/GeoIP/GeoLite2-City.mmdb"),
+        Path("/var/lib/GeoIP/GeoLite2-Country.mmdb"),
+        Path("/var/lib/GeoIP/GeoLite2-City.mmdb"),
+    ]
+
+    for p in candidates:
+        if p.is_file():
+            return p
+
+    # Compatibility with an earlier user-local Python MaxMind setup:
+    # perform a shallow one-time search only when known paths miss.
+    roots = [
+        HOME / ".local/share",
+        HOME / ".config",
+        HOME / "GeoIP",
+    ]
+    names = ("GeoLite2-Country.mmdb", "GeoLite2-City.mmdb",
+             "GeoIP2-Country.mmdb", "GeoIP2-City.mmdb")
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for name in names:
+            try:
+                for p in root.glob(f"*/{name}"):
+                    if p.is_file():
+                        return p
+            except OSError:
+                pass
+    return None
+
+
+class CountryLookup:
+    """Read-only local MaxMind lookup. Database is opened once per command."""
+
+    def __init__(self):
+        self.db_path = find_maxmind_db()
+        self.reader = None
+        self.backend = None
+
+        if self.db_path is None:
+            return
+
+        try:
+            import geoip2.database
+            self.reader = geoip2.database.Reader(str(self.db_path))
+            self.backend = "geoip2"
+            return
+        except Exception:
+            self.reader = None
+
+        try:
+            import maxminddb
+            self.reader = maxminddb.open_database(str(self.db_path))
+            self.backend = "maxminddb"
+        except Exception:
+            self.reader = None
+            self.backend = None
+
+    def close(self):
+        if self.reader is not None:
+            try:
+                self.reader.close()
+            except Exception:
+                pass
+
+    def country(self, ip: str) -> str:
+        try:
+            addr = ipaddress.ip_address(ip)
+            if addr.is_private or addr.is_loopback or addr.is_link_local:
+                return "Local"
+        except Exception:
+            return ".."
+
+        if self.reader is None:
+            return ".."
+
+        try:
+            if self.backend == "geoip2":
+                response = self.reader.country(ip)
+                return (response.country.name
+                        or response.registered_country.name
+                        or "..")[:18]
+
+            record = self.reader.get(ip) or {}
+            country = record.get("country") or record.get("registered_country") or {}
+            names = country.get("names") or {}
+            return (names.get("en") or country.get("iso_code") or "..")[:18]
+        except Exception:
+            return ".."
+
+
+def load_job(job_id: int) -> dict:
+    if not STATE_FILE.exists():
+        raise SystemExit("Torrent queue is empty.")
+    data = json.loads(STATE_FILE.read_text())
+    for job in data.get("jobs", []):
+        if int(job.get("id", -1)) == job_id:
+            return job
+    raise SystemExit(f"Unknown queue job: {job_id}")
+
+def _query_one(job: dict, command: str, timeout: float = 2.0) -> str:
+    path = f"/run/user/{os.getuid()}/torrent-control.sock"
+
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+        s.settimeout(timeout + 1.0)
+        s.connect(path)
+        s.sendall((json.dumps({
+            "job_id": int(job["id"]),
+            "pid": int(job.get("pid") or 0),
+            "command": command,
+            "timeout": timeout,
+        }, separators=(",", ":")) + "\n").encode())
+        chunks = []
+        while True:
+            block = s.recv(65536)
+            if not block:
+                break
+            chunks.append(block)
+    return b"".join(chunks).decode(errors="replace")
+
+
+LIVE_DISCONNECT_TIMEOUT=0.75
+
+
+def disconnect_live_peers(job,ips):
+    """Best-effort worker eviction after authoritative global blocking."""
+    selected=list(dict.fromkeys(ips))
+
+    if not selected:
+        return False,"no IPs selected"
+
+    try:
+        raw=_query_one(
+            job,
+            "DROPPEERS " + ",".join(selected),
+            timeout=LIVE_DISCONNECT_TIMEOUT,
+        ).strip()
+    except Exception as exc:
+        return False,f"{type(exc).__name__}: {exc}"
+
+    if raw == "OK\tQUEUED\tPEERS":
+        return True,"worker accepted disconnect"
+
+    return False,raw or "empty worker reply"
+
+
+
+
+FILTERD_SOCKET="/run/torrent-get-filterd.sock"
+
+
+def filterd_query(request):
+    """
+    Direct permanent peer-filter control.
+
+    torrent-get-filterd owns persistence and nft enforcement.
+    No peer deny JSON and no management synchronization layer.
+    """
+    try:
+        with socket.socket(
+            socket.AF_UNIX,
+            socket.SOCK_STREAM,
+        ) as sock:
+            sock.settimeout(3.0)
+            sock.connect(FILTERD_SOCKET)
+            sock.sendall(
+                (
+                    json.dumps(
+                        request,
+                        separators=(",",":"),
+                    )
+                    + "\n"
+                ).encode()
+            )
+
+            chunks=[]
+
+            while True:
+                block=sock.recv(65536)
+
+                if not block:
+                    break
+
+                chunks.append(block)
+
+                if sum(
+                    len(item)
+                    for item in chunks
+                ) > 1024*1024:
+                    raise RuntimeError(
+                        "filterd reply too large"
+                    )
+
+        raw=b"".join(chunks)
+
+        if not raw:
+            return {
+                "ok":False,
+                "error":"empty filterd reply",
+            }
+
+        reply=json.loads(
+            raw.decode(
+                "utf-8",
+                errors="strict",
+            )
+        )
+
+        if not isinstance(reply,dict):
+            return {
+                "ok":False,
+                "error":"invalid filterd reply",
+            }
+
+        return reply
+
+    except Exception as exc:
+        return {
+            "ok":False,
+            "error":
+                f"{type(exc).__name__}: {exc}",
+        }
+
+
+def filterd_ips():
+    reply=filterd_query(
+        {"cmd":"list"}
+    )
+
+    if not reply.get("ok"):
+        return set()
+
+    return {
+        str(ip)
+        for ip in reply.get("ips",[])
+        if isinstance(ip,str)
+    }
+
+
+def block_many(ips,attempts=3):
+    """Block a frozen IP selection, reconciling uncertain batch replies."""
+    requested=list(dict.fromkeys(ips))
+    listed=filterd_query({"cmd":"list"})
+    before=(
+        {str(ip) for ip in listed.get("ips",[]) if isinstance(ip,str)}
+        if listed.get("ok") else set()
+    )
+    already=set(requested)&before
+    confirmed=set(already)
+    pending=[ip for ip in requested if ip not in confirmed]
+    retries=[]
+    reason="unknown filterd error"
+
+    for attempt in range(1,attempts+1):
+        if not pending:
+            break
+
+        reply=filterd_query({"cmd":"block_many","ips":pending})
+        if reply.get("ok"):
+            confirmed.update(pending)
+            pending=[]
+            break
+
+        reason=str(reply.get("error",reason))
+        listed=filterd_query({"cmd":"list"})
+        if listed.get("ok"):
+            denied={
+                str(ip) for ip in listed.get("ips",[])
+                if isinstance(ip,str)
+            }
+            confirmed.update(ip for ip in pending if ip in denied)
+            pending=[ip for ip in pending if ip not in confirmed]
+
+        if pending and attempt<attempts:
+            retries.append((attempt+1,len(pending),reason))
+            time.sleep(0.2*attempt)
+
+    return {
+        "blocked":confirmed-already,
+        "already":already,
+        "failed":{ip:reason for ip in pending},
+        "retries":retries,
+    }
+
+
+def query(job,command):
+    """
+    Normal IPC plus persistent/global peer-deny semantics.
+    """
+
+    if command.startswith("BLOCK "):
+        ip=command[6:].strip()
+
+        try:
+            ip=str(
+                ipaddress.ip_address(ip)
+            )
+        except ValueError:
+            return "ERROR\tinvalid IP\n"
+
+        reply=filterd_query(
+            {
+                "cmd":"block",
+                "ip":ip,
+            }
+        )
+
+        if not reply.get("ok"):
+            return (
+                "ERROR\tNFT filter block failed: "
+                + str(
+                    reply.get(
+                        "error",
+                        "unknown filterd error",
+                    )
+                )
+                + "\n"
+            )
+
+        # Operator classification remains separate from
+        # permanent network enforcement.
+
+        return f"OK\tBLOCKED\t{ip}\n"
+
+
+    if command.startswith("UNBLOCK "):
+        ip=command[8:].strip()
+
+        try:
+            ip=str(
+                ipaddress.ip_address(ip)
+            )
+        except ValueError:
+            return "ERROR\tinvalid IP\n"
+
+        reply=filterd_query(
+            {
+                "cmd":"unblock",
+                "ip":ip,
+            }
+        )
+
+        if not reply.get("ok"):
+            return (
+                "ERROR\tNFT filter unblock failed: "
+                + str(
+                    reply.get(
+                        "error",
+                        "unknown filterd error",
+                    )
+                )
+                + "\n"
+            )
+
+        store=globals().get("_GEN3_STORE")
+        if store is not None:
+            try:
+                store.unblock(ip)
+            except Exception:
+                pass
+
+        return f"OK\tUNBLOCKED\t{ip}\n"
+
+
+    if command=="BLOCKS":
+        reply=filterd_query(
+            {"cmd":"list"}
+        )
+
+        if not reply.get("ok"):
+            return (
+                "ERROR\tNFT filter list failed: "
+                + str(
+                    reply.get(
+                        "error",
+                        "unknown filterd error",
+                    )
+                )
+                + "\n"
+            )
+
+        denied=sorted(
+            str(ip)
+            for ip in reply.get("ips",[])
+            if isinstance(ip,str)
+        )
+
+        out=[
+            f"BLOCKS\t{len(denied)}"
+        ]
+
+        out.extend(
+            f"BLOCK\t{ip}"
+            for ip in denied
+        )
+
+        return "\n".join(out)+"\n"
+
+
+    raw=_query_one(
+        job,
+        command
+    )
+
+    return raw
+
+
+def rolling_aggregate_download(current):
+    """
+    Ephemeral 30-second aggregate sampler.
+
+    Stored only under /run/user/... and therefore disappears
+    across reboot. No durable traffic history is created.
+    """
+    now=time.time()
+    samples=[]
+
+    try:
+        raw=json.loads(
+            RATE_SAMPLE_STATE.read_text()
+        )
+
+        for rec in raw.get("samples",[]):
+            if (
+                isinstance(rec,list)
+                and len(rec)==2
+            ):
+                ts=float(rec[0])
+                value=int(rec[1])
+
+                if now-ts <= 30.0:
+                    samples.append(
+                        [ts,value]
+                    )
+
+    except Exception:
+        pass
+
+    samples.append(
+        [now,int(current)]
+    )
+
+    samples=[
+        rec
+        for rec in samples
+        if now-rec[0] <= 30.0
+    ]
+
+    RATE_SAMPLE_STATE.parent.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+    RATE_SAMPLE_STATE.parent.chmod(0o700)
+
+    tmp=RATE_SAMPLE_STATE.with_suffix(
+        ".tmp"
+    )
+
+    tmp.write_text(
+        json.dumps(
+            {"samples":samples},
+            separators=(",",":")
+        )
+    )
+
+    tmp.chmod(0o600)
+
+    os.replace(
+        tmp,
+        RATE_SAMPLE_STATE
+    )
+
+    average=(
+        sum(rec[1] for rec in samples)
+        / len(samples)
+        if samples
+        else 0
+    )
+
+    span=(
+        max(
+            1,
+            min(
+                30,
+                int(now-samples[0][0])
+            )
+        )
+        if samples
+        else 1
+    )
+
+    return average,span
+
+
+def title_bar(title,rates=None):
+    width = shutil.get_terminal_size((100, 24)).columns
+    clock = time.strftime('%I:%M %p').lstrip('0')
+    right=(
+        clock
+        if rates is None
+        else (
+            f"↓ {human_rate(rates[0])}  "
+            f"↑ {human_rate(rates[1])}   "
+            f"{clock}"
+        )
+    )
+    gap = 3
+
+    if width >= len(title) + len(right) + gap:
+        print(title + ' ' * (width - len(title) - len(right)) + right)
+    else:
+        print(title)
+
+    print('-' * min(width, 126))
+
+
+
+RATE_DIR = Path.home() / ".local/share/torrent-get"
+RATE_STATE = RATE_DIR / "rate-limits.json"
+RATE_SAMPLE_STATE = Path(
+    f"/run/user/{os.getuid()}/torrent-get/peer-rate-samples.json"
+)
+
+
+
+def parse_rate(text):
+    text=str(text or '').strip()
+
+    if not text:
+        raise SystemExit(
+            "Invalid rate."
+        )
+
+    # Hidden operator shorthand.
+    #
+    # Uppercase is intentional:
+    #   K = KiB/s
+    #   M = MiB/s
+    #   G = GiB/s
+    #   T = TiB/s
+    #
+    # Existing long-form syntax remains accepted for compatibility.
+    short=re.fullmatch(
+        r"([0-9]+(?:\.[0-9]+)?)([KMGT])",
+        text
+    )
+
+    if short:
+        value=float(short.group(1))
+        factor={
+            "K":1024,
+            "M":1024**2,
+            "G":1024**3,
+            "T":1024**4,
+        }[short.group(2)]
+
+        result=int(value*factor)
+
+        if result < 0 or result > (2**63 - 1):
+            raise SystemExit("Rate outside supported range.")
+
+        return result
+
+    raw=text.casefold()
+
+    if raw in {"0","off","none","unlimited"}:
+        return 0
+
+    longform=re.fullmatch(
+        r"([0-9]+(?:\.[0-9]+)?)"
+        r"(b/s|kb/s|kib/s|mb/s|mib/s|gb/s|gib/s|tb/s|tib/s|"
+        r"b|kb|kib|mb|mib|gb|gib|tb|tib)?",
+        raw
+    )
+
+    if not longform:
+        raise SystemExit(
+            "Invalid rate."
+        )
+
+    value=float(longform.group(1))
+    unit=longform.group(2) or "b/s"
+
+    factors={
+        "b":1,
+        "b/s":1,
+
+        "kb":1000,
+        "kb/s":1000,
+        "kib":1024,
+        "kib/s":1024,
+
+        "mb":1000**2,
+        "mb/s":1000**2,
+        "mib":1024**2,
+        "mib/s":1024**2,
+
+        "gb":1000**3,
+        "gb/s":1000**3,
+        "gib":1024**3,
+        "gib/s":1024**3,
+
+        "tb":1000**4,
+        "tb/s":1000**4,
+        "tib":1024**4,
+        "tib/s":1024**4,
+    }
+
+    result=int(value*factors[unit])
+
+    if result < 0 or result > (2**63 - 1):
+        raise SystemExit("Rate outside supported range.")
+
+    return result
+
+
+
+def configured_rates():
+    try:
+        d=json.loads(RATE_STATE.read_text())
+        if isinstance(d,dict):
+            return d
+    except Exception:
+        pass
+
+    return {
+        "global":{"down":0,"up":0},
+        "jobs":{}
+    }
+
+
+def save_rates(d):
+    RATE_DIR.mkdir(parents=True,exist_ok=True)
+    RATE_DIR.chmod(0o700)
+
+    tmp=RATE_STATE.with_suffix(".tmp")
+
+    tmp.write_text(
+        json.dumps(d,indent=2,sort_keys=True)
+    )
+
+    tmp.chmod(0o600)
+    os.replace(tmp,RATE_STATE)
+
+
+def set_configured_limit(target,direction,value):
+    d=configured_rates()
+
+    d.setdefault(
+        "global",
+        {"down":0,"up":0}
+    )
+
+    d.setdefault("jobs",{})
+
+    if target == "all":
+        d["global"][direction]=value
+    else:
+        rec=d["jobs"].setdefault(
+            str(int(target)),
+            {"down":0,"up":0}
+        )
+
+        rec[direction]=value
+
+    save_rates(d)
+
+
+def display_rate(value):
+    if not value:
+        return "unlimited"
+    return human_rate(value)
+
+
+def active_rate_markers(job):
+    """Return display markers for limits active in the live worker."""
+
+    try:
+        raw=query(job,"LIMITS").strip()
+
+        if raw.startswith("LIMITS\t"):
+            parts=raw.split("\t")
+
+            if len(parts) >= 3:
+                down=int(parts[1] or 0)
+                up=int(parts[2] or 0)
+
+                return (
+                    "↓" if down > 0 else "",
+                    "↑" if up > 0 else "",
+                )
+    except Exception:
+        pass
+
+    # No marker unless the worker confirms an active limit.
+    return "",""
+
+
+def effective_rate_markers(job):
+    """
+    Return markers for rate limits effectively governing this job.
+
+    Per-job configuration overrides the corresponding global value.
+    A zero/unlimited job value therefore inherits any active global
+    limit for display purposes.
+    """
+
+    configured=configured_rates()
+
+    global_cfg=configured.get(
+        "global",
+        {"down":0,"up":0}
+    )
+
+    personal=configured.get(
+        "jobs",
+        {}
+    ).get(
+        str(int(job["id"])),
+        {"down":0,"up":0}
+    )
+
+    personal_down=int(
+        personal.get("down",0)
+        or 0
+    )
+
+    personal_up=int(
+        personal.get("up",0)
+        or 0
+    )
+
+    effective_down=(
+        personal_down
+        if personal_down > 0
+        else int(
+            global_cfg.get("down",0)
+            or 0
+        )
+    )
+
+    effective_up=(
+        personal_up
+        if personal_up > 0
+        else int(
+            global_cfg.get("up",0)
+            or 0
+        )
+    )
+
+    return (
+        "↓ " if effective_down > 0 else "",
+        "↑ " if effective_up > 0 else "",
+    )
+
+
+
+def parse_peer_rows(raw):
+    """
+    Parse peer-row selections.
+
+    Accepted:
+      1
+      1 4 7
+      1-7
+      1 -7
+      1- 7
+      1 - 7
+      1-3 7 10-14
+
+    Ranges are inclusive.
+    Duplicate rows collapse.
+    Reversed ranges fail before any action.
+    """
+
+    if isinstance(raw,(list,tuple)):
+        text=" ".join(str(x) for x in raw)
+    else:
+        text=str(raw)
+
+    # Canonicalize whitespace around a range hyphen.
+    #
+    # 1 -7
+    # 1- 7
+    # 1 - 7
+    #
+    # all become:
+    #
+    # 1-7
+    text=re.sub(
+        r'(?<=\d)\s*-\s*(?=\d)',
+        '-',
+        text
+    )
+
+    tokens=text.replace(","," ").split()
+    rows=[]
+
+    for token in tokens:
+
+        if token.isdigit():
+            value=int(token)
+
+            if value < 1:
+                raise ValueError(
+                    "peer row numbers must be positive"
+                )
+
+            rows.append(value)
+            continue
+
+        match=re.fullmatch(
+            r'([0-9]+)-([0-9]+)',
+            token
+        )
+
+        if not match:
+            raise ValueError(
+                f"invalid peer row selection: {token}"
+            )
+
+        first=int(match.group(1))
+        last=int(match.group(2))
+
+        if first < 1 or last < 1:
+            raise ValueError(
+                "peer row numbers must be positive"
+            )
+
+        if last < first:
+            raise ValueError(
+                f"reversed peer range: {token}"
+            )
+
+        rows.extend(
+            range(first,last+1)
+        )
+
+    if not rows:
+        raise ValueError(
+            "no peer rows selected"
+        )
+
+    return list(dict.fromkeys(rows))
+
+
+def live_peer_ips(job):
+    raw=query(job,"PEERS")
+
+    ips=[]
+
+    for line in raw.splitlines():
+        parts=line.split("\t")
+
+        if len(parts)>=2 and parts[0]=="PEER":
+            ips.append(parts[1])
+
+    return ips
+
+
+def start_regulator():
+    subprocess.run(
+        [
+            "systemctl","--user","start",
+            "torrent-rate-regulator.service"
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+
+def refresh_peer_view():
+    """
+    Replace the current Peer Control process with a fresh invocation.
+    No peer-view state survives the refresh.
+    """
+    os.execv(
+        sys.executable,
+        [
+            sys.executable,
+            os.path.abspath(__file__),
+            *sys.argv[1:],
+        ],
+    )
+
+
+def show_scope_limits(scope):
+    configured=configured_rates()
+
+    global_cfg=configured.get(
+        "global",
+        {"down":0,"up":0}
+    )
+
+    print()
+
+    if scope=="all":
+        print("Global rate limits")
+        print(
+            "Download: "
+            + display_rate(global_cfg.get("down",0))
+        )
+        print(
+            "Upload:   "
+            + display_rate(global_cfg.get("up",0))
+        )
+        print()
+        return
+
+    job=load_job(int(scope))
+
+    personal=configured.get(
+        "jobs",{}
+    ).get(
+        str(job["id"]),
+        {"down":0,"up":0}
+    )
+
+    print(f"Job [{job['id']}] — {job['name']}")
+    print(
+        "Job download:    "
+        + display_rate(personal.get("down",0))
+    )
+    print(
+        "Job upload:      "
+        + display_rate(personal.get("up",0))
+    )
+    print(
+        "Global download: "
+        + display_rate(global_cfg.get("down",0))
+    )
+    print(
+        "Global upload:   "
+        + display_rate(global_cfg.get("up",0))
+    )
+
+    try:
+        raw=query(job,"LIMITS").strip()
+    except (TimeoutError,OSError):
+        print("Active worker limits: unavailable")
+        print()
+        return
+
+    if raw.startswith("LIMITS\t"):
+        parts=raw.split("\t")
+
+        if len(parts)==3:
+            print(
+                "Active download: "
+                + display_rate(int(parts[1]))
+            )
+            print(
+                "Active upload:   "
+                + display_rate(int(parts[2]))
+            )
+
+    print()
+
+
+def apply_scope_limit(scope,direction,value):
+    """
+    Apply rate control to the already-selected Peer Control scope.
+    """
+    set_configured_limit(
+        scope,
+        direction,
+        value
+    )
+
+    start_regulator()
+
+    if scope=="all":
+        print(
+            f"Global {direction} limit: "
+            f"{display_rate(value)}"
+        )
+        return
+
+    job=load_job(int(scope))
+
+    command=(
+        "LIMIT DOWN "
+        if direction=="down"
+        else "LIMIT UP "
+    ) + str(value)
+
+    try:
+        raw=query(job,command).strip()
+    except (TimeoutError,OSError):
+        print(
+            f"Job [{job['id']}] {direction} limit stored: "
+            f"{display_rate(value)}"
+        )
+        print(
+            "Active worker did not answer immediately; "
+            "the configured limit remains authoritative."
+        )
+        return
+
+    if raw.startswith("ERROR"):
+        print(
+            f"Job [{job['id']}] {direction} limit stored: "
+            f"{display_rate(value)}"
+        )
+    else:
+        print(
+            f"Job [{job['id']}] {direction} limit: "
+            f"{display_rate(value)}"
+        )
+
+
+def interactive_rate_control(scope):
+    """
+    Rate controls inherit the current Peer Control scope:
+      job ID -> per-job rates
+      all    -> global rates
+    """
+    while True:
+        print()
+
+        try:
+            choice=input(
+                "Rate control — d=download, u=upload, "
+                "s=show, q=back: "
+            ).strip()
+        except (EOFError,KeyboardInterrupt):
+            print()
+            return
+
+        if not choice:
+            continue
+
+        lowered=choice.casefold()
+
+        if lowered in {"q","quit","back"}:
+            return
+
+        if lowered in {"s","show"}:
+            show_scope_limits(scope)
+            continue
+
+        if lowered not in {
+            "d","download",
+            "u","upload",
+        }:
+            print(
+                "Use d=download, u=upload, s=show, or q=back."
+            )
+            continue
+
+        direction=(
+            "down"
+            if lowered in {"d","download"}
+            else "up"
+        )
+
+        label=(
+            "Download"
+            if direction=="down"
+            else "Upload"
+        )
+
+        try:
+            raw_value=input(
+                f"{label} limit (RATE or unlimited): "
+            ).strip()
+        except (EOFError,KeyboardInterrupt):
+            print()
+            continue
+
+        if not raw_value:
+            continue
+
+        try:
+            value=parse_rate(raw_value)
+        except (ValueError,SystemExit) as exc:
+            print(exc)
+            continue
+
+        apply_scope_limit(
+            scope,
+            direction,
+            value
+        )
+
+        # Redraw immediately.
+        #
+        # This is especially important globally because the existing
+        # ↓ / ↑ markers are rendered from configured_rates() at page
+        # construction time. The fresh page therefore reflects the
+        # newly active limit immediately.
+        refresh_peer_view()
+
+
+def interactive_peer_controls(rows,scope):
+    """
+    Live Peer Control surface.
+
+    rows:
+      exact peer rows currently displayed in memory
+
+    scope:
+      queue job ID or 'all'
+
+    Nothing is persisted by the view.
+    """
+    while True:
+        print()
+
+        try:
+            choice=input(
+                "b=block, c=contents, l=limits, p=peers, r=refresh, q=quit: "
+            ).strip()
+        except (EOFError,KeyboardInterrupt):
+            print()
+            continue
+
+        if not choice:
+            continue
+
+        lowered=choice.casefold()
+
+        # Direct block shorthand:
+        #
+        #   b 1
+        #   b 1-7
+        #   b 1 3 5-9
+        #
+        # Bare b / block retains the existing second prompt.
+        direct_block_rows=None
+
+        if lowered.startswith("b "):
+            direct_block_rows=choice[2:].strip()
+            lowered="b"
+        elif lowered.startswith("block "):
+            direct_block_rows=choice[6:].strip()
+            lowered="block"
+
+        if lowered in {"q","quit","exit"}:
+            if os.environ.get("TORRENT_PEERS_RETURN_TO_CONTENTS")=="1":
+                return
+            if not MGMNT.is_file() or not os.access(MGMNT,os.X_OK):
+                raise SystemExit(
+                    f"torrent-mgmnt is not executable: {MGMNT}"
+                )
+            os.execv(str(MGMNT),[str(MGMNT)])
+
+        if lowered in {"c","contents"}:
+            env=os.environ.copy()
+            env["TORRENT_MGMNT_INTERNAL_CONTENTS"]="1"
+            subprocess.run(
+                [
+                    str(HOME/".local/bin/torrent-mgmnt"),
+                    "contents",
+                    str(scope),
+                ],
+                env=env,
+                check=False,
+            )
+            refresh_peer_view()
+
+        if lowered in {"p","peers"}:
+            payload_peer_mode()
+
+
+        if lowered in {"r","refresh"}:
+            refresh_peer_view()
+
+        if lowered in {"l","limits"}:
+            interactive_rate_control(scope)
+            continue
+
+        if lowered not in {"b","block"}:
+            print(
+                "Use b [rows]=block, c=contents, l=limits, "
+                "p=peers, r=refresh, or q=quit."
+            )
+            continue
+
+        if not rows:
+            print("No live peer rows to block.")
+            continue
+
+        if direct_block_rows is not None:
+            raw_rows=direct_block_rows
+        else:
+            try:
+                raw_rows=input(
+                    "Block peer row(s): "
+                ).strip()
+            except (EOFError,KeyboardInterrupt):
+                print()
+                continue
+
+        if not raw_rows:
+            continue
+
+        try:
+            selected=parse_peer_rows(raw_rows)
+        except ValueError:
+            print(
+                "Block accepts peer rows and ranges, e.g. 1-7 12 18-22."
+            )
+            continue
+
+        invalid=[
+            row for row in selected
+            if row < 1 or row > len(rows)
+        ]
+
+        if invalid:
+            print(
+                "Live peer row(s) unavailable: "
+                + " ".join(
+                    str(x)
+                    for x in invalid
+                )
+            )
+            continue
+
+        # Resolve ALL requested rows from the exact displayed
+        # in-memory table before issuing the first BLOCK.
+        targets=[
+            (
+                row,
+                int(rows[row-1]["job"]),
+                str(rows[row-1]["ip"]),
+            )
+            for row in selected
+        ]
+
+        try:
+            data=json.loads(
+                STATE_FILE.read_text()
+            )
+        except Exception as exc:
+            print(
+                f"Unable to read torrent queue state: {exc}"
+            )
+            continue
+
+        jobs={
+            int(job["id"]):job
+            for job in data.get("jobs",[])
+        }
+
+        missing=[
+            jid
+            for _,jid,_ in targets
+            if jid not in jobs
+        ]
+
+        if missing:
+            print(
+                "Queue ownership unavailable for job(s): "
+                + " ".join(
+                    str(x)
+                    for x in dict.fromkeys(missing)
+                )
+            )
+            continue
+
+        # Resolve the complete operator selection first, then
+        # perform ONE native filter transaction.
+        #
+        # No per-row socket churn and no repeated nft snapshots.
+        block_ips=list(
+            dict.fromkeys(
+                ip
+                for _,_,ip in targets
+            )
+        )
+
+        outcome=block_many(block_ips)
+        successful=outcome["blocked"]|outcome["already"]
+        successful_ips=[ip for ip in block_ips if ip in successful]
+
+        if outcome["failed"]:
+            for ip,reason in outcome["failed"].items():
+                print(f"Failed: {ip} — {reason}")
+
+        if not successful:
+            continue
+
+        disconnected,disconnect_detail=disconnect_live_peers(
+            load_job(int(scope)),
+            successful_ips,
+        )
+
+        for row,jid,ip in targets:
+            if ip not in successful:
+                continue
+            print(
+                f"Row {row}: blocked globally {ip} "
+                f"[Job {jid}] + live disconnect "
+                + (
+                    "confirmed"
+                    if disconnected
+                    else "not confirmed"
+                )
+            )
+
+        if not disconnected:
+            print(
+                "Live disconnect detail: "
+                + disconnect_detail
+            )
+
+        # Stay at the same control surface.
+        continue
+
+
+
+def interactive_all_peer_controls(rows):
+    """
+    Operator controls for the GLOBAL live-peer view only.
+
+    Job-scoped peer controls are deliberately unchanged.
+
+      b ROW... = block displayed live peer(s)
+      u IP     = unblock a persistent IP
+      bl       = list persistent blocked IPs
+      l        = global rate limits
+      p        = choose peer scope
+      r        = refresh all peers
+      q        = return to torrent-mgmnt
+    """
+
+    def refresh_all():
+        os.execv(
+            sys.executable,
+            [
+                sys.executable,
+                os.path.abspath(__file__),
+                "all",
+            ],
+        )
+
+    def back_to_management():
+        if not MGMNT.is_file() or not os.access(MGMNT,os.X_OK):
+            raise SystemExit(
+                f"torrent-mgmnt is not executable: {MGMNT}"
+            )
+        os.execv(str(MGMNT),[str(MGMNT)])
+
+    def parse_rows(tokens):
+        selected=[]
+
+        text=" ".join(str(token) for token in tokens)
+        text=re.sub(r'(?<=\d)\s*-\s*(?=\d)', '-', text)
+
+        for token in text.replace(","," ").split():
+            token=token.strip()
+
+            if not token:
+                continue
+
+            if "-" in token:
+                parts=token.split("-",1)
+
+                if (
+                    len(parts)!=2
+                    or not parts[0].isdigit()
+                    or not parts[1].isdigit()
+                ):
+                    raise ValueError
+
+                first=int(parts[0])
+                last=int(parts[1])
+
+                if first<1 or last<first:
+                    raise ValueError
+
+                selected.extend(
+                    range(first,last+1)
+                )
+
+            else:
+                if not token.isdigit():
+                    raise ValueError
+
+                selected.append(int(token))
+
+        # Preserve operator order while removing duplicates.
+        return list(dict.fromkeys(selected))
+
+    while True:
+        try:
+            choice=input(
+                "b=block, u=unblock, bl=blocked, "
+                "l=limits, p=peers, r=refresh, q=quit: "
+            ).strip()
+
+        except (EOFError,KeyboardInterrupt):
+            print()
+            back_to_management()
+
+        if not choice:
+            continue
+
+        parts=choice.split()
+        command=parts[0].casefold()
+        values=parts[1:]
+
+        if command in {"q","quit","exit"}:
+            back_to_management()
+
+        if command in {"r","refresh"}:
+            refresh_all()
+
+        if command in {"l","limit","limits"}:
+            if values:
+                print("Use l with no additional arguments.")
+                continue
+
+            interactive_rate_control("all")
+            continue
+
+        if command in {"p","peers"}:
+            if values:
+                print("Use p with no additional arguments.")
+                continue
+
+            try:
+                target=input(
+                    "Peer view — job ID, or Enter for all: "
+                ).strip()
+
+            except (EOFError,KeyboardInterrupt):
+                print()
+                continue
+
+            if not target:
+                refresh_all()
+
+            try:
+                jid=int(target)
+            except ValueError:
+                print(
+                    "Peer view accepts a numeric job ID "
+                    "or Enter for all."
+                )
+                continue
+
+            if jid < 1:
+                print("Peer view requires a positive job ID.")
+                continue
+
+            # Enter the EXISTING job-scoped peer view unchanged.
+            os.execv(
+                sys.executable,
+                [
+                    sys.executable,
+                    os.path.abspath(__file__),
+                    str(jid),
+                ],
+            )
+
+        if command in {"bl","blocked","blocks"}:
+            if values:
+                print("Use bl with no additional arguments.")
+                continue
+
+            reply=filterd_query(
+                {"cmd":"list"}
+            )
+
+            print()
+            print("Persistent globally blocked peers")
+            print()
+
+            if not reply.get("ok"):
+                print(
+                    "Blocked-peer list unavailable — "
+                    + str(
+                        reply.get(
+                            "error",
+                            "unknown filterd error",
+                        )
+                    )
+                )
+                print()
+                continue
+
+            ips=sorted(
+                str(ip)
+                for ip in reply.get("ips",[])
+                if isinstance(ip,str)
+            )
+
+            if not ips:
+                print("No blocked peers.")
+            else:
+                for number,ip in enumerate(ips,1):
+                    print(
+                        f"{number:>3}  {ip}"
+                    )
+
+            print()
+            continue
+
+        if command in {"u","unblock"}:
+            if len(values)!=1:
+                print("Usage: u IP")
+                continue
+
+            try:
+                ip=str(
+                    ipaddress.ip_address(
+                        values[0]
+                    )
+                )
+            except ValueError:
+                print("Invalid IP address.")
+                continue
+
+            reply=filterd_query(
+                {
+                    "cmd":"unblock",
+                    "ip":ip,
+                }
+            )
+
+            if not reply.get("ok"):
+                print(
+                    "Unblock failed — "
+                    + str(
+                        reply.get(
+                            "error",
+                            "unknown filterd error",
+                        )
+                    )
+                )
+                continue
+
+            # Keep any existing operator-classification store aligned
+            # with the permanent enforcement decision.
+            store=globals().get("_GEN3_STORE")
+            if store is not None:
+                try:
+                    store.unblock(ip)
+                except Exception:
+                    pass
+
+            print(f"Unblocked: {ip}")
+            continue
+
+        if command in {"b","block"}:
+            if not values:
+                print(
+                    "Usage: b ROW [ROW ...]"
+                )
+                print(
+                    "Rows and ranges are accepted, "
+                    "e.g. b 1-7 12 18-22."
+                )
+                continue
+
+            try:
+                selected=parse_rows(values)
+            except ValueError:
+                print(
+                    "Block accepts peer rows and ranges, "
+                    "e.g. b 1-7 12 18-22."
+                )
+                continue
+
+            invalid=[
+                row
+                for row in selected
+                if row<1 or row>len(rows)
+            ]
+
+            if invalid:
+                print(
+                    "Live peer row(s) unavailable: "
+                    + " ".join(
+                        str(row)
+                        for row in invalid
+                    )
+                )
+                continue
+
+            # Resolve the entire displayed selection before changing
+            # permanent policy. Display rows are authoritative only
+            # for this invocation.
+            targets=[]
+
+            for row_number in selected:
+                row=rows[row_number-1]
+
+                targets.append(
+                    (
+                        row_number,
+                        int(row["job"]),
+                        str(row["ip"]),
+                    )
+                )
+
+            block_ips=list(
+                dict.fromkeys(
+                    ip
+                    for _,_,ip in targets
+                )
+            )
+
+            outcome=block_many(block_ips)
+            successful=outcome["blocked"]|outcome["already"]
+
+            if outcome["failed"]:
+                for ip,reason in outcome["failed"].items():
+                    print(f"Failed: {ip} — {reason}")
+
+            if not successful:
+                refresh_all()
+
+            affected_jobs=list(
+                dict.fromkeys(
+                    jid
+                    for _,jid,_ in targets
+                    if any(
+                        target_jid==jid and ip in successful
+                        for _,target_jid,ip in targets
+                    )
+                )
+            )
+
+            disconnect_outcomes={}
+
+            for jid in affected_jobs:
+                job_ips=list(
+                    dict.fromkeys(
+                        ip
+                        for _,target_jid,ip in targets
+                        if target_jid==jid and ip in successful
+                    )
+                )
+                disconnect_outcomes[jid]=disconnect_live_peers(
+                    load_job(jid),
+                    job_ips,
+                )
+
+            for row_number,jid,ip in targets:
+                if ip not in successful:
+                    continue
+                disconnected,_=disconnect_outcomes[jid]
+                print(
+                    f"Row {row_number}: blocked globally {ip} "
+                    f"[Job {jid}] + live disconnect "
+                    + (
+                        "confirmed"
+                        if disconnected
+                        else "not confirmed"
+                    )
+                )
+
+            for jid,(disconnected,detail) in disconnect_outcomes.items():
+                if not disconnected:
+                    print(
+                        f"Job {jid} live disconnect detail: "
+                        + detail
+                    )
+
+            # The live table is stale after enforcement.
+            # Rebuild it rather than allowing row numbers to drift.
+            refresh_all()
+
+        print(
+            "Use b=block, u=unblock, bl=blocked, "
+            "l=limits, p=peers, r=refresh, q=quit."
+        )
+
+def global_peer_view():
+    """
+    Aggregate live peers across queue-owned RUNNING jobs.
+
+    Read-only:
+      - queue defines ownership
+      - existing worker UNIX sockets supply STATUS + PEERS
+      - no process scan
+      - no persistence
+    """
+    if not STATE_FILE.exists():
+        print()
+        print("Queue is empty.")
+        print()
+        return
+
+    try:
+        data=json.loads(STATE_FILE.read_text())
+    except Exception as exc:
+        raise SystemExit(
+            f"Unable to read torrent queue state: {exc}"
+        )
+
+    jobs=[
+        job for job in data.get("jobs",[])
+        if job.get("state")=="RUNNING"
+        and job.get("pid") is not None
+    ]
+
+    all_rows=[]
+    torrent_down=0
+    torrent_up=0
+    torrent_wire_down=0
+    torrent_wire_up=0
+    receiving_torrents=0
+    active_jobs=0
+
+    for job in jobs:
+        try:
+            status_raw=query(job,"STATUS")
+            sx=status_raw.strip().split("\t")
+
+            status=None
+
+            if len(sx)>=9 and sx[0]=="STATUS":
+                status={
+                    "metadata":sx[1]=="1",
+                    "progress":float(sx[2]),
+                    "size":int(sx[3]),
+                    "down":int(sx[4]),
+                    "up":int(sx[5]),
+                    "wire_down":int(sx[9]) if len(sx)>=11 else int(sx[4]),
+                    "wire_up":int(sx[10]) if len(sx)>=11 else int(sx[5]),
+                    "peers":int(sx[6]),
+                    "seeds":int(sx[7]),
+                }
+
+            raw=query(job,"PEERS")
+
+        except (SystemExit, OSError, TimeoutError, ValueError):
+            # Queue ownership remains authoritative. A temporarily
+            # unavailable live socket contributes no fabricated data.
+            continue
+
+        active_jobs += 1
+
+        if status:
+            torrent_down += status["down"]
+            torrent_up += status["up"]
+            torrent_wire_down += status.get("wire_down",status["down"])
+            torrent_wire_up += status.get("wire_up",status["up"])
+            if status["down"] > 0:
+                receiving_torrents += 1
+
+        for line in raw.splitlines():
+            parts=line.split("\t")
+
+            if len(parts)<10 or parts[0]!="PEER":
+                continue
+
+            try:
+                received_bytes=(
+                    int(parts[13] or 0)
+                    if len(parts)>=15
+                    else None
+                )
+
+                torrent_size=(
+                    status["size"]
+                    if status
+                    and status.get("size",0)>0
+                    else None
+                )
+
+                received=(
+                    min(
+                        100.0,
+                        (
+                            received_bytes
+                            / torrent_size
+                        ) * 100.0
+                    )
+                    if received_bytes is not None
+                    and torrent_size
+                    else None
+                )
+
+            except (
+                ValueError,
+                TypeError,
+                ZeroDivisionError,
+            ):
+                received=None
+
+            try:
+                down=int(parts[4] or 0)
+                up=int(parts[5] or 0)
+            except ValueError:
+                down=0
+                up=0
+
+            all_rows.append({
+                "job":int(job["id"]),
+                "ip":parts[1],
+                "port":parts[2],
+                "client":parts[3],
+                "down":down,
+                "up":up,
+                "wire_down":int(parts[11] or 0) if len(parts)>=13 else down,
+                "wire_up":int(parts[12] or 0) if len(parts)>=13 else up,
+                "seed":parts[6]=="1",
+                "have":parts[7],
+                "interesting":parts[8]=="1",
+                "received":received,
+                "blocked":(
+                    len(parts)>10 and parts[10]=="1"
+                ),
+            })
+
+
+    seeds=sum(1 for row in all_rows if row["seed"])
+    receiving=sum(
+        1 for row in all_rows
+        if row["down"]>0
+    )
+    sending=sum(
+        1 for row in all_rows
+        if row["up"]>0
+    )
+
+    title_bar(
+        'torrent-peers — Peer Control Module',
+        (torrent_down,torrent_up),
+    )
+    print()
+    print("Global Live Peer View — not stored")
+    print()
+
+    # Operator totals belong at the top.
+    # Surface active GLOBAL rate limits without another IPC query.
+    global_cfg=configured_rates().get(
+        "global",
+        {"down":0,"up":0}
+    )
+
+    global_down_marker=(
+        "↓ "
+        if int(global_cfg.get("down",0) or 0) > 0
+        else ""
+    )
+
+    global_up_marker=(
+        "↑ "
+        if int(global_cfg.get("up",0) or 0) > 0
+        else ""
+    )
+
+    if wire_mode():
+        print(
+            "Payload:          "
+            f"{global_down_marker}Down {human_rate(torrent_down)} | "
+            f"{global_up_marker}Up {human_rate(torrent_up)}"
+        )
+
+        print(
+            "Wire:             "
+            f"Down {human_rate(torrent_wire_down)} | "
+            f"Up {human_rate(torrent_wire_up)}"
+        )
+
+        print(
+            "Overhead:         "
+            f"Down {human_rate(max(0,torrent_wire_down-torrent_down))} | "
+            f"Up {human_rate(max(0,torrent_wire_up-torrent_up))}"
+        )
+
+    else:
+        print(
+            "Aggregate:        "
+            f"{global_down_marker}Down {human_rate(torrent_down)} | "
+            f"{global_up_marker}Up {human_rate(torrent_up)}"
+        )
+
+    rolling_down,rolling_seconds=(
+        rolling_aggregate_download(
+            torrent_down
+        )
+    )
+
+    print(
+        "Average download: "
+        f"{human_rate(rolling_down)} "
+        f"over {rolling_seconds}s"
+    )
+
+
+
+    print(
+        f"Connected: {len(all_rows)} | "
+        f"Complete peers: {seeds} | "
+        f"Receiving from: {receiving} | "
+        f"Sending to: {sending} | "
+        f"Torrents: {active_jobs}"
+    )
+
+    print()
+
+    if not all_rows:
+        print("No connected peers at this moment.")
+        interactive_peer_controls([], "all")
+        return
+
+    print(
+        f"{'#':>3}  "
+        f"{'Job':>4}  "
+        f"{'IP':<39} "
+        f"{'Country':<18} "
+        f"{'Port':>5}  "
+        f"{'Client':<20} "
+        f"{'Down':>11} "
+        f"{'Up':>11} "
+        f"{'Received':>11} "
+        f"{'Have':>7}  "
+        f"{'Role':<5}"
+    )
+
+    print("-"*161)
+
+    geo=CountryLookup()
+
+    try:
+        for i,row in enumerate(all_rows,1):
+            raw_client=row["client"]
+            client="..." if raw_client=="?" else raw_client
+
+            if len(client)>20:
+                client=client[:17]+"..."
+
+            role="seed" if row["seed"] else "peer"
+
+            have=(
+                "?"
+                if row["have"]=="?"
+                else row["have"]+"%"
+            )
+
+            country=geo.country(row["ip"])
+
+            received=(
+                f'{row["received"]:.1f}%'
+                if row["received"] is not None
+                else "--"
+            )
+
+            print(
+                f"{i:>3}  "
+                f"{row['job']:>4}  "
+                f"{row['ip']:<39} "
+                f"{country:<18} "
+                f"{row['port']:>5}  "
+                f"{client:<20} "
+                f"{human_rate(row['down']):>11} "
+                f"{human_rate(row['up']):>11} "
+                f"{received:>11} "
+                f"{have:>7}  "
+                f"{role:<5}"
+                + (
+                    "  BLOCKED"
+                    if row.get("blocked")
+                    else ""
+                )
+            )
+    finally:
+        geo.close()
+
+    print()
+
+    # Rows remain authoritative only for this invocation.
+    #
+    # Foreground/background split:
+    #
+    # torrent-mgmnt owns operator prompts for the ALL view.
+    # torrent-peers supplies the rendered snapshot plus the exact
+    # in-memory row mapping from the same invocation.
+    if os.environ.get(
+        "TORRENT_PEERS_MGMT_SNAPSHOT"
+    )=="1":
+        print(
+            "__TORRENT_PEERS_ROWS__"
+            + json.dumps(
+                all_rows,
+                separators=(",",":"),
+            )
+        )
+        return
+
+    interactive_all_peer_controls(all_rows)
+
+
+def main():
+
+    if len(sys.argv)==1:
+        global_peer_view()
+        return
+
+    if (
+        len(sys.argv)>=2
+        and sys.argv[1].casefold()=="gen3"
+    ):
+        gen3_command(
+            sys.argv[2:]
+        )
+        return
+
+    # ========================================================
+    # BACKGROUND / SHELL CONTROL COMMANDS
+    #
+    # These commands use the existing torrent-get-filterd socket.
+    # No additional IPC authority or persistence exists.
+    # ========================================================
+
+    if (
+        len(sys.argv)>=2
+        and sys.argv[1].casefold() in {"f","find"}
+    ):
+        values=sys.argv[2:]
+
+        if not values:
+            raise SystemExit(
+                "Usage: torrent-peers f IP [IP ...]"
+            )
+
+        normalized=[]
+
+        for value in values:
+            try:
+                normalized.append(
+                    str(
+                        ipaddress.ip_address(
+                            value
+                        )
+                    )
+                )
+            except ValueError:
+                raise SystemExit(
+                    f"Invalid IP address: {value}"
+                )
+
+        reply=filterd_query(
+            {"cmd":"list"}
+        )
+
+        if not reply.get("ok"):
+            raise SystemExit(
+                "Blocked-peer search failed — "
+                + str(
+                    reply.get(
+                        "error",
+                        "unknown filterd error",
+                    )
+                )
+            )
+
+        denied={
+            str(ip)
+            for ip in reply.get("ips",[])
+            if isinstance(ip,str)
+        }
+
+        for ip in normalized:
+            print(
+                (
+                    "BLOCKED"
+                    if ip in denied
+                    else "CLEAR"
+                )
+                + "\t"
+                + ip
+            )
+
+        return
+
+
+    if (
+        len(sys.argv)>=2
+        and sys.argv[1]=="__mgmt-block-many"
+    ):
+        values=sys.argv[2:]
+
+        if not values:
+            raise SystemExit(
+                "No peer IPs supplied."
+            )
+
+        ips=[]
+
+        for value in values:
+            try:
+                ips.append(
+                    str(
+                        ipaddress.ip_address(
+                            value
+                        )
+                    )
+                )
+            except ValueError:
+                raise SystemExit(
+                    f"Invalid IP address: {value}"
+                )
+
+        ips=list(dict.fromkeys(ips))
+
+        outcome=block_many(ips)
+
+        for attempt,count,reason in outcome["retries"]:
+            print(f"RETRY\t{attempt}\t{count}\t{reason}")
+        for ip in ips:
+            if ip in outcome["already"]:
+                print(f"ALREADY_BLOCKED\t{ip}")
+            elif ip in outcome["blocked"]:
+                print(f"BLOCKED\t{ip}")
+            else:
+                print(f"FAILED\t{ip}\t{outcome['failed'][ip]}")
+
+        return
+
+
+    if (
+        len(sys.argv)>=2
+        and sys.argv[1]=="__mgmt-unblock"
+    ):
+        if len(sys.argv)!=3:
+            raise SystemExit(
+                "Internal unblock requires one IP."
+            )
+
+        try:
+            ip=str(
+                ipaddress.ip_address(
+                    sys.argv[2]
+                )
+            )
+        except ValueError:
+            raise SystemExit(
+                f"Invalid IP address: {sys.argv[2]}"
+            )
+
+        reply=filterd_query(
+            {
+                "cmd":"unblock",
+                "ip":ip,
+            }
+        )
+
+        if not reply.get("ok"):
+            raise SystemExit(
+                "Unblock failed — "
+                + str(
+                    reply.get(
+                        "error",
+                        "unknown filterd error",
+                    )
+                )
+            )
+
+        store=globals().get("_GEN3_STORE")
+        if store is not None:
+            try:
+                store.unblock(ip)
+            except Exception:
+                pass
+
+        print(
+            f"UNBLOCKED\t{ip}"
+        )
+        return
+
+
+    if (
+        len(sys.argv)==2
+        and sys.argv[1]=="__mgmt-blocks"
+    ):
+        reply=filterd_query(
+            {"cmd":"list"}
+        )
+
+        if not reply.get("ok"):
+            raise SystemExit(
+                "Blocked-peer list failed — "
+                + str(
+                    reply.get(
+                        "error",
+                        "unknown filterd error",
+                    )
+                )
+            )
+
+        for ip in sorted(
+            str(ip)
+            for ip in reply.get("ips",[])
+            if isinstance(ip,str)
+        ):
+            print(ip)
+
+        return
+
+
+    if (
+        len(sys.argv)==2
+        and sys.argv[1]=="__mgmt-rates"
+    ):
+        cfg=configured_rates().get(
+            "global",
+            {"down":0,"up":0}
+        )
+
+        print(
+            json.dumps(
+                {
+                    "down":int(
+                        cfg.get("down",0) or 0
+                    ),
+                    "up":int(
+                        cfg.get("up",0) or 0
+                    ),
+                },
+                separators=(",",":"),
+            )
+        )
+
+        return
+
+
+    ap = argparse.ArgumentParser(
+        prog="torrent-peers",
+        description="Show or control live peers for a torrent queue job. Peer observations are live; deny decisions persist."
+    )
+    # Production CLI grammar:
+    #
+    #   torrent-peers ID
+    #   torrent-peers COMMAND [OPERAND ...] ID
+    #
+    # The final positional operand owns the queue/global target.
+    # Everything between COMMAND and TARGET remains naturally
+    # space-delimited.
+    ap.add_argument(
+        "action",
+        nargs="?",
+        choices=["block","unblock","blocks","limit","limits"],
+        help="peer/rate command; omit when opening the live peer view"
+    )
+    ap.add_argument(
+        "values",
+        nargs="*",
+        help="space-delimited command operands"
+    )
+    ap.add_argument(
+        "target",
+        help="final queue job number, or 'all' for a global rate limit"
+    )
+    args = ap.parse_args()
+
+    if args.action is not None:
+        title_bar('torrent-peers — Peer Control Module')
+
+    if args.target == "all":
+        # Bare "all" is the read-only aggregate peer view.
+        # Rate-control forms retain their existing meaning.
+        if args.action is None:
+            global_peer_view()
+            return
+
+        if args.action != "limit":
+            raise SystemExit(
+                "'all' is valid only with: "
+                "torrent-peers limit {down|up} RATE all"
+            )
+        job = None
+    else:
+        try:
+            args.id=int(args.target)
+        except ValueError:
+            raise SystemExit("Target must be a queue job number or 'all'.")
+
+        job=load_job(args.id)
+
+    if args.action == "limit":
+        if len(args.values) != 2:
+            raise SystemExit(
+                "Usage: torrent-peers limit {down|up} RATE ID|all"
+            )
+
+        direction=args.values[0].lower()
+
+        if direction not in {"down","up"}:
+            raise SystemExit("Direction must be down or up.")
+
+        value=parse_rate(args.values[1])
+
+        set_configured_limit(
+            args.target,
+            direction,
+            value
+        )
+
+        start_regulator()
+
+        if args.target == "all":
+            print(
+                f"Global {direction} limit: "
+                f"{display_rate(value)}"
+            )
+            return
+
+        command=(
+            "LIMIT DOWN "
+            if direction=="down"
+            else "LIMIT UP "
+        ) + str(value)
+
+        raw=query(job,command).strip()
+
+        if raw.startswith("ERROR"):
+            print(
+                f"Job [{job['id']}] {direction} limit stored: "
+                f"{display_rate(value)}"
+            )
+            print(
+                "Active worker uses the earlier IPC release; "
+                "the limit will apply after that job is restarted/resumed."
+            )
+        else:
+            print(
+                f"Job [{job['id']}] {direction} limit: "
+                f"{display_rate(value)}"
+            )
+
+        return
+
+    if args.action == "limits":
+        if args.values:
+            raise SystemExit("Usage: torrent-peers limits ID")
+
+        configured=configured_rates()
+
+        personal=configured.get(
+            "jobs",{}
+        ).get(
+            str(job["id"]),
+            {"down":0,"up":0}
+        )
+
+        global_cfg=configured.get(
+            "global",
+            {"down":0,"up":0}
+        )
+
+        print()
+        print(f"Job [{job['id']}] — {job['name']}")
+        print(
+            "Job download:    "
+            + display_rate(personal.get("down",0))
+        )
+        print(
+            "Job upload:      "
+            + display_rate(personal.get("up",0))
+        )
+        print(
+            "Global download: "
+            + display_rate(global_cfg.get("down",0))
+        )
+        print(
+            "Global upload:   "
+            + display_rate(global_cfg.get("up",0))
+        )
+
+        raw=query(job,"LIMITS").strip()
+
+        if raw.startswith("LIMITS\t"):
+            parts=raw.split("\t")
+
+            if len(parts)==3:
+                print(
+                    "Active download: "
+                    + display_rate(int(parts[1]))
+                )
+                print(
+                    "Active upload:   "
+                    + display_rate(int(parts[2]))
+                )
+
+        print()
+        return
+
+    if args.action == "block":
+        raise SystemExit(
+            "Peer rows are controlled from the live peer view. "
+            "Run 'torrent-peers all' or 'torrent-peers ID'."
+        )
+
+    if args.action == "unblock":
+        if len(args.values) != 1:
+            raise SystemExit(
+                "Usage: torrent-peers unblock IP ID"
+            )
+
+        raw=query(
+            job,
+            f"UNBLOCK {args.values[0]}"
+        ).strip()
+
+        if raw.startswith("ERROR"):
+            raise SystemExit(raw)
+
+        print(raw)
+        return
+
+    if args.action == "blocks":
+        raw = query(job, "BLOCKS")
+        ips = [line.split("\t", 1)[1] for line in raw.splitlines()
+               if line.startswith("BLOCK\t")]
+        print()
+        print(f"Job [{job['id']}] — {job['name']}")
+        print("Persistent globally blocked peers")
+        print()
+        if not ips:
+            print("No blocked peers.")
+        else:
+            for i, ip in enumerate(ips, 1):
+                print(f"{i:>3}  {ip}")
+        print()
+        return
+
+    try:
+        status_raw = query(job, "STATUS")
+    except TimeoutError:
+        raise SystemExit(
+            f"Job [{job['id']}] live interface timed out. "
+            "Try again or use r=refresh from the live peer view."
+        )
+    except OSError as exc:
+        raise SystemExit(
+            f"Job [{job['id']}] live interface unavailable: {exc}"
+        )
+
+    sx = status_raw.strip().split("\t")
+    status = None
+    if len(sx) >= 9 and sx[0] == "STATUS":
+        try:
+            status = {
+                "metadata": sx[1] == "1", "progress": float(sx[2]), "size": int(sx[3]),
+                "down": int(sx[4]), "up": int(sx[5]),
+                "wire_down": int(sx[9]) if len(sx)>=11 else int(sx[4]),
+                "wire_up": int(sx[10]) if len(sx)>=11 else int(sx[5]),
+                "peers": int(sx[6]), "seeds": int(sx[7])
+            }
+        except Exception:
+            status = None
+
+    try:
+        raw = query(job, "PEERS")
+    except TimeoutError:
+        raise SystemExit(
+            f"Job [{job['id']}] peer interface timed out. "
+            "Try again or use r=refresh from the live peer view."
+        )
+    except OSError as exc:
+        raise SystemExit(
+            f"Job [{job['id']}] peer interface unavailable: {exc}"
+        )
+
+    lines = raw.splitlines()
+
+    rows = []
+    for line in lines:
+        parts = line.split("\t")
+        if len(parts) >= 10 and parts[0] == "PEER":
+            try:
+                received_bytes=(
+                    int(parts[13] or 0)
+                    if len(parts)>=15
+                    else None
+                )
+
+                torrent_size=(
+                    status["size"]
+                    if status
+                    and status.get("size",0)>0
+                    else None
+                )
+
+                received=(
+                    min(
+                        100.0,
+                        (
+                            received_bytes
+                            / torrent_size
+                        ) * 100.0
+                    )
+                    if received_bytes is not None
+                    and torrent_size
+                    else None
+                )
+
+            except (
+                ValueError,
+                TypeError,
+                ZeroDivisionError,
+            ):
+                received=None
+            rows.append({
+                "job": int(job["id"]),
+                "ip": parts[1],
+                "port": parts[2],
+                "client": parts[3],
+                "down": int(parts[4] or 0),
+                "up": int(parts[5] or 0),
+                "wire_down": int(parts[11] or 0) if len(parts)>=13 else int(parts[4] or 0),
+                "wire_up": int(parts[12] or 0) if len(parts)>=13 else int(parts[5] or 0),
+                "seed": parts[6] == "1",
+                "have": parts[7],
+                "interesting": parts[8] == "1",
+                "received": received,
+                "blocked": (len(parts) > 10 and parts[10] == "1"),
+            })
+
+    title_bar(
+        'torrent-peers — Peer Control Module',
+        (
+            int(status.get("down",0)) if status else 0,
+            int(status.get("up",0)) if status else 0,
+        ),
+    )
+    print()
+    print(f"Job [{job['id']}] — {job['name']}")
+
+    if status and status["metadata"]:
+        print(
+            f"Progress: "
+            f"{status['progress']*100:.1f}% "
+            f"of {human_size(status['size'])}"
+        )
+    else:
+        print("Progress: waiting for metadata")
+
+    print()
+
+    torrent_down=(
+        int(status.get("down",0))
+        if status
+        else 0
+    )
+
+    torrent_up=(
+        int(status.get("up",0))
+        if status
+        else 0
+    )
+
+    torrent_wire_down=(
+        int(
+            status.get(
+                "wire_down",
+                torrent_down
+            )
+        )
+        if status
+        else 0
+    )
+
+    torrent_wire_up=(
+        int(
+            status.get(
+                "wire_up",
+                torrent_up
+            )
+        )
+        if status
+        else 0
+    )
+
+    down_marker,up_marker=effective_rate_markers(
+        job
+    )
+
+    if wire_mode():
+        print(
+            "Payload:          "
+            f"{down_marker}Down {human_rate(torrent_down)} | "
+            f"{up_marker}Up {human_rate(torrent_up)}"
+        )
+
+        print(
+            "Wire:             "
+            f"Down {human_rate(torrent_wire_down)} | "
+            f"Up {human_rate(torrent_wire_up)}"
+        )
+
+        print(
+            "Overhead:         "
+            f"Down {human_rate(max(0,torrent_wire_down-torrent_down))} | "
+            f"Up {human_rate(max(0,torrent_wire_up-torrent_up))}"
+        )
+
+    else:
+        print(
+            "Aggregate:        "
+            f"{down_marker}Down {human_rate(torrent_down)} | "
+            f"{up_marker}Up {human_rate(torrent_up)}"
+        )
+
+    rolling_down,rolling_seconds=(
+        rolling_aggregate_download(
+            torrent_down
+        )
+    )
+
+    print(
+        "Average download: "
+        f"{human_rate(rolling_down)} "
+        f"over {rolling_seconds}s"
+    )
+
+    seeds=sum(
+        1
+        for x in rows
+        if x["seed"]
+    )
+
+    active_down=sum(
+        1
+        for x in rows
+        if x["down"] > 0
+    )
+
+    active_up=sum(
+        1
+        for x in rows
+        if x["up"] > 0
+    )
+
+    print(
+        f"Connected: {len(rows)} | "
+        f"Complete peers: {seeds} | "
+        f"Receiving from: {active_down} | "
+        f"Sending to: {active_up} | "
+        f"Torrents: 1"
+    )
+
+    print()
+
+    if not rows:
+        print(
+            "No connected peers at this moment."
+        )
+
+        interactive_peer_controls(
+            [],
+            str(job["id"])
+        )
+        return
+
+    print(
+        f"{'#':>3}  "
+        f"{'Job':>4}  "
+        f"{'IP':<39} "
+        f"{'Country':<18} "
+        f"{'Port':>5}  "
+        f"{'Client':<20} "
+        f"{'Down':>11} "
+        f"{'Up':>11} "
+        f"{'Received':>11} "
+        f"{'Have':>7}  "
+        f"{'Role':<5}"
+    )
+
+    print("-"*161)
+
+    geo=CountryLookup()
+
+    try:
+        for i,p in enumerate(rows,1):
+            raw_client=p["client"]
+
+            client=(
+                "..."
+                if raw_client=="?"
+                else raw_client
+            )
+
+            if len(client)>20:
+                client=client[:17]+"..."
+
+            role=(
+                "seed"
+                if p["seed"]
+                else "peer"
+            )
+
+            have=(
+                "?"
+                if p["have"]=="?"
+                else p["have"]+"%"
+            )
+
+            country=geo.country(
+                p["ip"]
+            )
+
+            received_text=(
+                f"{p['received']:.1f}%"
+                if p["received"] is not None
+                else "--"
+            )
+
+            print(
+                f"{i:>3}  "
+                f"{int(job['id']):>4}  "
+                f"{p['ip']:<39} "
+                f"{country:<18} "
+                f"{p['port']:>5}  "
+                f"{client:<20} "
+                f"{human_rate(p['down']):>11} "
+                f"{human_rate(p['up']):>11} "
+                f"{received_text:>11} "
+                f"{have:>7}  "
+                f"{role:<5}"
+                + (
+                    "  BLOCKED"
+                    if p.get("blocked")
+                    else ""
+                )
+            )
+
+    finally:
+        geo.close()
+
+    interactive_peer_controls(
+        rows,
+        str(job["id"])
+    )
+
+    print()
+
+if __name__ == "__main__":
+    main()

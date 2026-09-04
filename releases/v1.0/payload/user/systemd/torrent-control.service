@@ -1,0 +1,24 @@
+[Unit]
+Description=torrent-get socket-activated control service
+Requires=torrent-control.socket
+After=torrent-control.socket
+
+[Service]
+Type=simple
+Slice=torrent-get.slice
+ExecStart=%h/.local/libexec/torrent-control-service
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryHigh=48M
+MemoryMax=64M
+TasksMax=32
+LimitNOFILE=256

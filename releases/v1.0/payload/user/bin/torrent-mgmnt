@@ -1,0 +1,5082 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+import hashlib
+import contextlib
+import io
+import ipaddress
+import select
+import shutil
+import sys
+import shlex
+import argparse, fcntl, json, os, re, shutil, signal, socket, subprocess, time, uuid
+from collections import defaultdict
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+
+SECURITY_LIB=(
+    Path.home()
+    / ".local/lib/torrent-get/security"
+)
+
+if str(SECURITY_LIB) not in sys.path:
+    sys.path.insert(
+        0,
+        str(SECURITY_LIB),
+    )
+
+from approval_store import (
+    ApprovalStore,
+)
+
+
+HOME=Path.home()
+NETWORK_PAUSE_STATE=HOME/".local/share/torrent-get/network-pause.json"
+STATE_DIR=HOME/'.local/share/torrent-queue'
+STATE_FILE=STATE_DIR/'jobs.json'
+LOCK_FILE=STATE_DIR/'jobs.lock'
+LOG_DIR=STATE_DIR/'logs'
+RESUME_DIR=STATE_DIR/'resume'
+METADATA_APPROVAL_ROOT=HOME/".local/share/torrent-get/metadata-approvals"
+WORKER=HOME/'.local/libexec/torrent-worker-posix'
+PEERS=HOME/'.local/bin/torrent-peers'
+DEST_DEFAULT=HOME/'Downloads/Torrents'
+ENV_BIN=Path('/usr/bin/env') if Path('/usr/bin/env').exists() else Path('/bin/env')
+if not ENV_BIN.exists():
+ raise SystemExit('Required executable missing: env')
+MEMORY_HIGH='512M'
+MEMORY_MAX='1G'
+TASKS_MAX=128
+NOFILE=4096
+
+
+def _parse_numeric_selection(raw):
+    """Parse comma/whitespace-delimited numbers and inclusive ranges."""
+    text=(
+        " ".join(str(value) for value in raw)
+        if isinstance(raw,(list,tuple))
+        else str(raw)
+    )
+    text=re.sub(r'(?<=\d)\s*-\s*(?=\d)', '-', text)
+    selected=[]
+
+    for token in text.replace(',', ' ').split():
+        match=re.fullmatch(r'([0-9]+)(?:-([0-9]+))?', token)
+
+        if not match:
+            raise ValueError(f"invalid selection: {token}")
+
+        first=int(match.group(1))
+        last=int(match.group(2) or first)
+
+        if first<1 or last<first:
+            raise ValueError(f"invalid selection: {token}")
+
+        selected.extend(range(first,last+1))
+
+    if not selected:
+        raise ValueError("no selections")
+
+    return list(dict.fromkeys(selected))
+
+
+# torrent-get operator configuration.
+#
+# Configuration is owned by torrent-mgmnt.  torrent-get consumes
+# the resulting setting silently when submitting new jobs.
+TORRENT_GET_CONFIG=(
+    Path.home()
+    / ".local"
+    / "share"
+    / "torrent-get"
+    / "config.json"
+)
+
+def _load_torrent_get_config():
+    import json
+
+    try:
+        data=json.loads(TORRENT_GET_CONFIG.read_text())
+        if isinstance(data,dict):
+            return data
+    except Exception:
+        pass
+
+    return {}
+
+def _write_torrent_get_config(data):
+    import json
+    import os
+    import tempfile
+
+    parent=TORRENT_GET_CONFIG.parent
+    parent.mkdir(
+        mode=0o700,
+        parents=True,
+        exist_ok=True,
+    )
+
+    try:
+        parent.chmod(0o700)
+    except OSError:
+        pass
+
+    fd,tmp=tempfile.mkstemp(
+        prefix=".config.",
+        suffix=".tmp",
+        dir=str(parent),
+    )
+
+    tmp_path=Path(tmp)
+
+    try:
+        with os.fdopen(fd,"w",encoding="utf-8") as handle:
+            json.dump(
+                data,
+                handle,
+                indent=2,
+                sort_keys=True,
+            )
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+
+        os.chmod(tmp_path,0o600)
+        os.replace(
+            tmp_path,
+            TORRENT_GET_CONFIG,
+        )
+        os.chmod(
+            TORRENT_GET_CONFIG,
+            0o600,
+        )
+
+    finally:
+        try:
+            tmp_path.unlink()
+        except FileNotFoundError:
+            pass
+
+def _configured_download_folder():
+    data=_load_torrent_get_config()
+
+    raw=str(
+        data.get("download_folder","")
+    ).strip()
+
+    if raw:
+        path=Path(raw).expanduser()
+
+        if path.is_absolute() and path.is_dir():
+            return path
+
+    return Path.home() / "Downloads"
+
+def configure_download_folder():
+    current=_configured_download_folder()
+
+    print()
+    print("Current download folder:")
+    print(f"  {current}")
+    print()
+
+    while True:
+        try:
+            raw=input(
+                "Enter full path (Enter=keep current, q=cancel): "
+            ).strip()
+        except (EOFError,KeyboardInterrupt):
+            print()
+            print("Configuration cancelled.")
+            return
+
+        if not raw:
+            print()
+            print("Download folder unchanged:")
+            print(f"  {current}")
+            return
+
+        if raw.casefold()=="q":
+            print()
+            print("Configuration cancelled.")
+            return
+
+        selected=Path(raw).expanduser()
+
+        if selected.is_absolute() and selected.is_dir():
+            break
+
+        print()
+        print(
+            "Download folder does not exist or is not a directory."
+        )
+        print()
+
+    data=_load_torrent_get_config()
+    data["download_folder"]=str(selected)
+    _write_torrent_get_config(data)
+
+    print()
+    print("Download folder updated:")
+    print(f"  {selected}")
+
+def ensure_dirs():
+ STATE_DIR.mkdir(parents=True,exist_ok=True); LOG_DIR.mkdir(parents=True,exist_ok=True)
+
+def boot_id():
+ try:return Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+ except OSError:return ''
+
+def durable_json_write(path,data):
+ path=Path(path); tmp=path.with_name(path.name+f'.tmp.{os.getpid()}'); previous=path.with_name(path.name+'.prev')
+ payload=(json.dumps(data,indent=2,sort_keys=True)+'\n').encode()
+ fd=os.open(tmp,os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o600)
+ try:
+  offset=0
+  while offset<len(payload):offset+=os.write(fd,payload[offset:])
+  os.fsync(fd)
+ finally:os.close(fd)
+ had_current=path.exists()
+ if had_current:os.replace(path,previous)
+ try:os.replace(tmp,path)
+ except BaseException:
+  if had_current and previous.exists():os.replace(previous,path)
+  raise
+ dirfd=os.open(path.parent,os.O_RDONLY|os.O_DIRECTORY)
+ try:os.fsync(dirfd)
+ finally:os.close(dirfd)
+ os.chmod(path,0o600)
+
+def load_state():
+ empty={'next_id':1,'jobs':[]}
+ if not STATE_FILE.exists():return empty
+ try:return json.loads(STATE_FILE.read_text())
+ except Exception as primary_error:
+  previous=STATE_FILE.with_name(STATE_FILE.name+'.prev')
+  try:return json.loads(previous.read_text())
+  except Exception:raise RuntimeError(f'Queue state is unreadable: {primary_error}')
+
+class locked_state:
+ def __enter__(self):
+  ensure_dirs(); self.fp=open(LOCK_FILE,'a+'); fcntl.flock(self.fp.fileno(),fcntl.LOCK_EX)
+  self.data=load_state()
+  return self.data
+ def __exit__(self,t,v,tb):
+  if t is None:
+   durable_json_write(STATE_FILE,self.data)
+  fcntl.flock(self.fp.fileno(),fcntl.LOCK_UN); self.fp.close()
+
+def magnet_fields(m):
+ q=parse_qs(urlparse(m).query); dn=(q.get('dn') or ['Unnamed torrent'])[0]; xt=(q.get('xt') or [''])[0]
+ return dn,xt.rsplit(':',1)[-1].upper() if xt else ''
+
+
+def source_fields(source):
+ source=str(source or "").strip()
+
+ if not source.startswith("magnet:?"):
+  raise SystemExit(
+   "Rejected: production torrent import accepts magnet URIs only."
+  )
+
+ name,ih=magnet_fields(source)
+
+ return source,"magnet",name,ih
+
+
+def proc_start(pid):
+ try:return int(Path(f'/proc/{pid}/stat').read_text().split()[21])
+ except:return None
+
+def proc_argv(pid):
+ try:return [x.decode(errors='replace') for x in Path(f'/proc/{pid}/cmdline').read_bytes().split(b'\0') if x]
+ except:return []
+
+def cmdline(pid):
+ return ' '.join(proc_argv(pid))
+
+def alive(j):
+ if j.get('boot_id') and j.get('boot_id')!=boot_id():return False
+ pid=int(j.get('pid') or 0)
+ ticks=proc_start(pid)
+
+ if (
+  pid<=0
+  or ticks is None
+  or ticks!=j.get('proc_start_ticks')
+ ):
+  return False
+
+ argv=proc_argv(pid)
+
+ if not argv:
+  return False
+
+ executable=Path(argv[0]).name
+
+ if "torrent-worker-posix" not in executable:
+  return False
+
+ nonce=str(j.get('worker_nonce') or '')
+ if nonce and (len(argv)<6 or argv[5]!=nonce):
+  return False
+
+ source=str(
+  j.get("source")
+  or j.get("magnet")
+  or ""
+ ).strip()
+
+ if not source:
+  return True
+
+ return (
+  len(argv)>=2
+  and argv[1]==source
+ )
+
+def safe_target(j):
+ p=Path(j['expected_payload']).expanduser(); dest=Path(j['save_path']).expanduser().resolve()
+ try:par=p.parent.resolve()
+ except:return None
+ return p if par==dest or dest in par.parents else None
+
+def worker_orphaned(j):
+ logp=Path(j.get('log_path') or '')
+ if not logp.exists():return False
+ try:
+  with logp.open('rb') as f:
+   f.seek(0,2); size=f.tell(); f.seek(max(0,size-8192))
+   tail=f.read().decode(errors='replace')
+  return 'ORPHANED: metadata unavailable after 5 minutes.' in tail
+ except OSError:return False
+
+def checkpoint_status(j):
+ path=RESUME_DIR/f"job-{int(j['id'])}.fastresume"
+ candidates=[p for p in (path,path.with_name(path.name+'.prev')) if p.is_file()]
+ usable=[p for p in candidates if p.stat().st_size>0]
+ if not usable:return False,None,None
+ generation=max(p.stat().st_mtime_ns for p in usable)
+ return True,int(generation//1_000_000_000),generation
+
+def refresh(j):
+ recorded_boot=str(j.get('boot_id') or '')
+ a=alive(j); p=safe_target(j); ex=bool(p and p.exists())
+ if a and not j.get('source'):
+  argv=proc_argv(int(j.get('pid') or 0))
+
+  if len(argv)>=2:
+   candidate=str(argv[1]).strip()
+
+   if candidate.startswith('magnet:?'):
+    j['source']=candidate
+
+    if not j.get('magnet'):
+     j['magnet']=candidate
+ if ex:j['payload_seen']=True
+ checkpoint_ok,checkpoint_at,checkpoint_generation=checkpoint_status(j)
+ j['checkpoint_valid']=checkpoint_ok
+ j['checkpoint_at']=checkpoint_at
+ j['checkpoint_generation']=checkpoint_generation
+ if a:
+  j['state']='MISSING' if j.get('payload_seen') and not ex else ('PAUSING' if j.get('state')=='PAUSING' else 'RUNNING')
+ else:
+  prior=j.get('state')
+  if prior=='PAUSING':j['state']='PAUSED' if checkpoint_ok else 'RECOVERABLE'
+  elif prior in {'RUNNING','MISSING'}:
+   j['state']='ORPHANED' if worker_orphaned(j) else 'RECOVERABLE'
+   if j['state']=='RECOVERABLE':
+    j['recovery_reason']='previous boot ended' if recorded_boot and recorded_boot!=boot_id() else 'worker ownership lost'
+  else:j['state']=prior or 'EXITED'
+
+ # Dead worker identity must not survive reconciliation.
+ if j.get('state') in {'ORPHANED','RECOVERABLE','PAUSED'}:
+  j['pid']=None
+  j['proc_start_ticks']=None
+ j['last_checked']=int(time.time())
+
+def get_job(s,jid):return next((j for j in s['jobs'] if int(j['id'])==jid),None)
+
+def human_size(n):
+ if n is None:return '--'
+ v=float(max(0,n)); u=['B','KiB','MiB','GiB','TiB']; i=0
+ while v>=1024 and i<len(u)-1:v/=1024;i+=1
+ return f'{v:.0f} {u[i]}' if i==0 else f'{v:.1f} {u[i]}'
+
+
+def display_pid(j):
+    # PID may remain in queue state for historical/recovery identity.
+    # The operator plane displays only a currently live RUNNING PID.
+    if j.get("state") != "RUNNING":
+        return "--"
+
+    pid=j.get("pid")
+
+    if not pid:
+        return "--"
+
+    try:
+        os.kill(int(pid),0)
+    except (ProcessLookupError,ValueError,TypeError):
+        return "--"
+    except PermissionError:
+        pass
+
+    return str(pid)
+
+
+def activity(st,j):
+ if not alive(j):return '--'
+ if not st:return 'STARTING'
+ if not st['metadata']:return 'METADATA'
+
+ p=st['progress']
+
+ # Activity is a live-work statement, not a torrent-rate guess.
+ #
+ # Ask the same worker PEERS interface used by torrent-peers.
+ # A torrent is DOWNLOADING only when at least one peer currently
+ # reports positive payload receive work; likewise for upload.
+ #
+ # PEER records are tab-separated. Rather than depending on client
+ # names, IP versions, or display formatting, identify numeric rate
+ # fields from the worker's PEER record itself.
+ raw=socket_query(j,'PEERS',timeout=1.0)
+
+ receiving=False
+ sending=False
+ peer_truth=bool(
+  raw
+  and raw.splitlines()
+  and raw.splitlines()[0].startswith("PEERS\t")
+ )
+
+ if raw:
+  for line in raw.splitlines():
+   x=line.split('\t')
+
+   if not x or x[0]!='PEER':
+    continue
+
+   # The worker PEERS interface currently carries its live payload
+   # rates as integer fields. Use the same two rate positions consumed
+   # by torrent-peers: down then up.
+   #
+   # We deliberately fail back to STATUS if the record shape cannot
+   # be established, rather than inventing activity.
+   try:
+    peer_down=int(x[4])
+    peer_up=int(x[5])
+   except (IndexError,TypeError,ValueError):
+    continue
+
+   peer_truth=True
+
+   if peer_down>0:
+    receiving=True
+
+   if peer_up>0:
+    sending=True
+
+ if p>=0.9995:
+  if peer_truth:
+   return 'UPLOADING' if sending else 'COMPLETE'
+  return 'SEEDING' if st['up']>0 else 'COMPLETE'
+
+ if peer_truth:
+  if receiving and sending:return 'TRANSFER'
+  if receiving:return 'DOWNLOADING'
+  if sending:return 'UPLOADING'
+  return 'IDLE'
+
+ # PEERS unavailable: retain historical STATUS behavior rather than
+ # falsely converting an unavailable live interface to IDLE.
+ down=st['down']; up=st['up']
+ if down>0 and up>0:return 'TRANSFER'
+ if down>0:return 'DOWNLOADING'
+ if up>0:return 'UPLOADING'
+ return 'IDLE'
+
+def socket_query(j,command,timeout=3.0):
+ p=Path(f"/run/user/{os.getuid()}/torrent-control.sock")
+ try:
+  with socket.socket(socket.AF_UNIX,socket.SOCK_STREAM) as s:
+   s.settimeout(timeout+1.0); s.connect(str(p)); s.sendall((json.dumps({
+    'job_id':int(j['id']),'pid':int(j.get('pid') or 0),
+    'command':command,'timeout':timeout
+   },separators=(',',':'))+'\n').encode()); raw=b''
+   while True:
+    b=s.recv(65536)
+    if not b:break
+    raw+=b
+   return raw.decode(errors='replace')
+ except:return None
+
+def live_status(j):
+ raw=socket_query(j,'STATUS')
+ if not raw:return None
+ x=raw.strip().split('\t')
+ try:
+  if len(x)>=9 and x[0]=='STATUS':
+   return {'metadata':x[1]=='1','progress':float(x[2]),'size':int(x[3]),'down':int(x[4]),'up':int(x[5]),'peers':int(x[6]),'seeds':int(x[7]),'name':x[8]}
+ except:pass
+ return None
+
+def systemd_main_pid(unit):
+ try:
+  out=subprocess.check_output(['systemctl','--user','show',unit,'-p','MainPID','--value'],text=True,stderr=subprocess.DEVNULL).strip(); pid=int(out or 0)
+  return pid if pid>0 else None
+ except:return None
+
+
+def retire_metadata_approval(job):
+    """
+    Retire Gatekeeper approval state belonging to this queue job.
+
+    Queue infohash is authoritative.
+    No title-specific matching.
+    """
+    raw=str(
+        job.get("infohash")
+        or ""
+    ).strip().lower()
+
+    if not raw:
+        return 0
+
+    store=ApprovalStore(
+        METADATA_APPROVAL_ROOT
+    )
+
+    if not store.root.exists():
+        return 0
+
+    removed=0
+
+    for record in store.list_records():
+        identity=record.identity
+
+        stored=str(
+            identity.infohash
+        ).strip().lower()
+
+        parts={
+            item.strip().lower()
+            for item in stored.split("|")
+            if item.strip()
+        }
+
+        candidates=set(parts)
+
+        for item in parts:
+            if ":" in item:
+                candidates.add(
+                    item.split(":",1)[1]
+                )
+
+        if raw not in candidates:
+            continue
+
+        if store.invalidate(identity):
+            removed+=1
+
+    return removed
+
+def launch_worker(j, torrent_source, save, logp, unit):
+ torrent_source=str(torrent_source)
+
+ if network_paused():
+  raise RuntimeError(
+   "Global torrent network is PAUSED; worker admission blocked."
+  )
+ runtime=Path(f"/run/user/{os.getuid()}/torrent-get")
+ runtime.mkdir(mode=0o700,parents=True,exist_ok=True)
+ runtime.chmod(0o700)
+
+ # Production Gatekeeper runtime.
+ #
+ # This directory is intentionally ephemeral.  It contains only the
+ # executable approval stack required by the sandboxed worker.  It is
+ # rebuilt from canonical production components and contains no
+ # diagnostic-history state.
+ security_runtime=runtime/"security"
+ security_runtime.mkdir(mode=0o700,parents=True,exist_ok=True)
+ security_runtime.chmod(0o700)
+
+ # Persistent approval records are not runtime history.
+ # They are the security authority needed to recognize an exact
+ # previously-approved metadata identity and manifest.
+ METADATA_APPROVAL_ROOT.mkdir(
+  mode=0o700,
+  parents=True,
+  exist_ok=True
+ )
+ METADATA_APPROVAL_ROOT.chmod(0o700)
+
+ approval_runtime=runtime/"metadata-approvals"
+ approval_runtime.mkdir(
+  mode=0o700,
+  parents=True,
+  exist_ok=True
+ )
+ approval_runtime.chmod(0o700)
+
+ security_components={
+  SECURITY_LIB/"approval_store.py":"approval_store.py",
+  SECURITY_LIB/"gate_store_connector.py":"gate_store_connector.py",
+  SECURITY_LIB/"gatekeeper_diagnostic_connector.py":"gatekeeper_diagnostic_connector.py",
+  HOME/".local/libexec/torrent-approval-bridge":"torrent-approval-bridge",
+ }
+
+ for source,name in security_components.items():
+  if not source.is_file():
+   raise RuntimeError(
+    f"Gatekeeper production component missing: {source}"
+   )
+
+  target=security_runtime/name
+  shutil.copy2(source,target)
+
+  if name=="torrent-approval-bridge":
+   target.chmod(0o700)
+  else:
+   target.chmod(0o600)
+
+ RESUME_DIR.mkdir(mode=0o700,parents=True,exist_ok=True)
+ RESUME_DIR.chmod(0o700)
+
+ resume_file=RESUME_DIR/f"job-{int(j['id'])}.fastresume"
+ worker_nonce=uuid.uuid4().hex
+
+ if not torrent_source.startswith("magnet:?"):
+  raise RuntimeError(
+   "Production worker accepts magnet URIs only."
+  )
+
+ cmd=[
+  'systemd-run','--user','--quiet','--collect','--service-type=exec','--slice=torrent-get.slice',f'--unit={unit}',
+  '--property=NoNewPrivileges=yes','--property=PrivateTmp=yes','--property=PrivateDevices=yes','--property=ProtectSystem=strict','--property=ProtectHome=tmpfs',
+  '--property=ProtectControlGroups=yes','--property=ProtectKernelModules=yes','--property=ProtectKernelTunables=yes','--property=ProtectKernelLogs=yes','--property=RestrictSUIDSGID=yes','--property=LockPersonality=yes',
+  '--property=SystemCallFilter=~@mount @swap @reboot @raw-io @module @obsolete @debug @cpu-emulation',
+  '--property=SystemCallErrorNumber=EPERM','--property=SystemCallArchitectures=native',
+  '--property=Restart=no','--property=KillMode=control-group','--property=TimeoutStopSec=20s','--property=SendSIGKILL=yes',
+  f'--property=MemoryHigh={MEMORY_HIGH}',f'--property=MemoryMax={MEMORY_MAX}',f'--property=TasksMax={TASKS_MAX}',f'--property=LimitNOFILE={NOFILE}',
+  f'--property=BindReadOnlyPaths={WORKER}',f'--property=BindPaths={save}',f'--property=BindPaths={runtime}',f'--property=BindPaths={METADATA_APPROVAL_ROOT}:{approval_runtime}',f'--property=BindPaths={RESUME_DIR}',
+  f'--property=ReadWritePaths={save}',f'--property=ReadWritePaths={runtime}',f'--property=ReadWritePaths={RESUME_DIR}',
+  f'--property=StandardOutput=append:{logp}',f'--property=StandardError=append:{logp}',
+  str(ENV_BIN),'-i','PATH=/usr/bin:/bin','HOME=/nonexistent','LANG=C',
+  str(WORKER),torrent_source,str(save),str(int(j['id'])),str(resume_file),worker_nonce
+ ]
+ r=subprocess.run(cmd,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,text=True)
+ if r.returncode!=0:raise SystemExit(f'Unable to launch sandboxed worker: {r.stderr.strip() or "systemd-run failed"}')
+ pid=None
+ for _ in range(100):
+  pid=systemd_main_pid(unit)
+  if pid:break
+  time.sleep(.02)
+ if not pid:
+  subprocess.run(['systemctl','--user','stop',unit],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+  raise SystemExit('Sandboxed worker launched but MainPID could not be resolved.')
+ j['pid']=pid; j['proc_start_ticks']=proc_start(pid); j['state']='RUNNING'; j['submitted_at']=int(time.time()); j['systemd_unit']=unit; j['sandbox']='systemd-stage1'; j['priority_applied_pid']=None
+ checkpoint_valid,checkpoint_at,checkpoint_generation=checkpoint_status(j)
+ j['boot_id']=boot_id(); j['worker_nonce']=worker_nonce; j['checkpoint_valid']=checkpoint_valid; j['checkpoint_at']=checkpoint_at; j['checkpoint_generation']=checkpoint_generation
+ j['limits']={'memory_high':MEMORY_HIGH,'memory_max':MEMORY_MAX,'tasks_max':TASKS_MAX,'nofile':NOFILE}
+ return pid
+
+def submit(source,save,origin=None):
+ if not WORKER.exists():
+  raise SystemExit(
+   f'Queue worker missing: {WORKER}'
+  )
+
+ source,source_type,name,ih=source_fields(source)
+
+ save=save.expanduser().resolve()
+ save.mkdir(parents=True,exist_ok=True)
+
+ candidate_ih=str(ih or "").strip().lower()
+
+ if not candidate_ih:
+  raise SystemExit(
+   "Rejected: torrent infohash unavailable."
+  )
+
+ # Duplicate detection and job-ID allocation share the same
+ # queue lock. A second submission therefore cannot race past
+ # an identical first submission.
+ with locked_state() as s:
+  for existing in s.get('jobs',[]):
+   existing_ih=str(
+    existing.get('infohash') or ""
+   ).strip().lower()
+
+   if (
+    existing_ih
+    and existing_ih == candidate_ih
+   ):
+    existing_id=int(
+     existing.get('id',0) or 0
+    )
+
+    raise SystemExit(
+     f"Already active as job [{existing_id}]."
+    )
+
+  jid=int(s.get('next_id',1))
+  s['next_id']=jid+1
+
+  logp=LOG_DIR/f'job-{jid}.log'
+  unit=f'torrent-worker-{jid}.service'
+  expected=save/name
+
+  # A newly allocated queue identity cannot inherit recovery
+  # state from any previous lifecycle.
+  stale_resume=RESUME_DIR/f"job-{jid}.fastresume"
+
+  for stale_generation in (stale_resume,stale_resume.with_name(stale_resume.name+'.prev')):
+   try:
+    stale_generation.unlink()
+   except FileNotFoundError:
+    pass
+   except OSError as exc:
+    raise RuntimeError(
+     f"Unable to clear stale fast-resume for new job [{jid}]: {exc}"
+    )
+
+  j={
+   'id':jid,
+   'name':name,
+   'infohash':ih,
+   'source':source,
+   'source_type':source_type,
+   'origin':str(origin or '...'),
+
+   # Preserve the legacy field for existing consumers.
+   # Native torrent jobs deliberately have no magnet.
+   'magnet':(
+    source
+    if source_type=="magnet"
+    else None
+   ),
+
+   'save_path':str(save),
+   'expected_payload':str(expected),
+   'payload_seen':expected.exists(),
+   'log_path':str(logp),
+   'restart_count':0,
+  }
+
+  launch_worker(
+   j,
+   source,
+   save,
+   logp,
+   unit
+  )
+
+  s['jobs'].append(j)
+
+ print(f'Request submitted to queue. Job [{jid}].')
+
+def resume(jid):
+ if not WORKER.exists():raise SystemExit(f'Queue worker missing: {WORKER}')
+ with locked_state() as s:
+  j=get_job(s,jid)
+  if not j:raise SystemExit(f'Unknown queue job: {jid}')
+  refresh(j)
+  if j['state'] in {'RUNNING','MISSING','STOPPING'}:raise SystemExit(f"Job [{jid}] is already active (state: {j['state']}).")
+  source=(
+   j.get('source')
+   or j.get('magnet')
+  )
+
+  if not source:
+   raise SystemExit(
+    f'Job [{jid}] has no persisted magnet source '
+    'and cannot be resumed.'
+   )
+
+  if not str(source).startswith("magnet:?"):
+   raise SystemExit(
+    f'Job [{jid}] uses an unsupported legacy non-magnet source.'
+   )
+
+  # Migrate an old magnet queue record when it is first resumed.
+  if not j.get('source'):
+   j['source']=source
+   j['source_type']='magnet'
+  save=Path(j['save_path']).expanduser().resolve(); save.mkdir(parents=True,exist_ok=True); logp=Path(j['log_path']); unit=f'torrent-worker-{jid}.service'
+  subprocess.run(['systemctl','--user','reset-failed',unit],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+  j['restart_count']=int(j.get('restart_count',0))+1; j['resumed_at']=int(time.time())
+  launch_worker(j,source,save,logp,unit)
+ print(f'Job [{jid}] resumed. Existing payload will be verified by libtorrent.')
+
+
+def worker_io_pressure(jid):
+    unit=f'torrent-worker-{jid}.service'
+
+    try:
+        cg=subprocess.check_output(
+            [
+                'systemctl','--user','show',unit,
+                '-p','ControlGroup','--value'
+            ],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except Exception:
+        return None
+
+    if not cg:
+        return None
+
+    pressure_file=Path('/sys/fs/cgroup') / cg.lstrip('/') / 'io.pressure'
+
+    try:
+        text=pressure_file.read_text()
+    except OSError:
+        return None
+
+    for line in text.splitlines():
+        if not line.startswith('full '):
+            continue
+
+        for field in line.split():
+            if field.startswith('avg10='):
+                try:
+                    return float(field.split('=',1)[1])
+                except ValueError:
+                    return None
+
+    return None
+
+
+def recovery_cleared(jid):
+    # Allow metadata/reverification activity to begin.
+    time.sleep(10)
+
+    low_samples=0
+
+    while True:
+        with locked_state() as s:
+            j=get_job(s,jid)
+
+            if not j:
+                return True
+
+            refresh(j)
+
+            if not alive(j):
+                return True
+
+        pressure=worker_io_pressure(jid)
+
+        # Conservative behavior if PSI cannot be read:
+        # do not release another recovery job.
+        if pressure is None:
+            low_samples=0
+            time.sleep(10)
+            continue
+
+        if pressure < 5.0:
+            low_samples += 1
+        else:
+            low_samples = 0
+
+        # Require a sustained quiet period.
+        if low_samples >= 3:
+            return True
+
+        time.sleep(10)
+
+
+def resume_dispatch():
+    while True:
+        with locked_state() as s:
+            queued=[
+                int(j['id'])
+                for j in s['jobs']
+                if j.get('state') == 'QUEUED'
+            ]
+
+        if not queued:
+            return
+
+        # Deterministic FIFO-by-job-ID recovery.
+        jid=min(queued)
+
+        try:
+            resume(jid)
+
+        except SystemExit as e:
+            with locked_state() as s:
+                j=get_job(s,jid)
+                if j:
+                    j['state']='STOPPED'
+
+            print(
+                f'Queued recovery failed for Job [{jid}]: {e}',
+                file=sys.stderr,
+            )
+            continue
+
+        recovery_cleared(jid)
+
+
+def resume_all():
+    with locked_state() as s:
+        ids=[]
+
+        for j in s['jobs']:
+            refresh(j)
+
+            if j.get('state') != 'STOPPED':
+                continue
+
+            j['state']='QUEUED'
+            ids.append(int(j['id']))
+
+    if not ids:
+        print('SYSTEM RESUMED — no stopped torrent jobs.')
+        return
+
+    unit='torrent-resume-dispatch.service'
+
+    active=subprocess.run(
+        [
+            'systemctl','--user','is-active',
+            '--quiet',unit
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    ).returncode == 0
+
+    if not active:
+        r=subprocess.run(
+            [
+                'systemd-run',
+                '--user',
+                '--quiet',
+                '--collect',
+                '--service-type=exec',
+                f'--unit={unit}',
+                str(Path.home()/'.local/bin/torrent-queue'),
+                'resume-dispatch',
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        if r.returncode != 0:
+            # Dispatcher failed: restore queue state.
+            with locked_state() as s:
+                for jid in ids:
+                    j=get_job(s,jid)
+                    if j and j.get('state') == 'QUEUED':
+                        j['state']='STOPPED'
+
+            raise SystemExit(
+                'Unable to start controlled recovery: '
+                + (r.stderr.strip() or 'systemd-run failed')
+            )
+
+    joined=' '.join(str(jid) for jid in ids)
+
+    print(
+        f'SYSTEM RESUMED — {len(ids)} job(s) queued '
+        f'for controlled restart [{joined}].'
+    )
+
+def reconcile_payload(j,st):
+ if not st or not st.get('metadata'):
+  return
+
+ name=(st.get('name') or '').strip()
+ if not name:
+  return
+
+ candidate=Path(name)
+
+ # Torrent metadata may identify only one top-level payload object.
+ # Never permit absolute paths, traversal, or embedded separators.
+ if (
+  candidate.is_absolute()
+  or len(candidate.parts)!=1
+  or candidate.name in {'','.','..'}
+  or '/' in name
+  or '\\' in name
+ ):
+  return
+
+ save=Path(j['save_path']).expanduser().resolve()
+ actual=save/candidate.name
+
+ j['torrent_name']=candidate.name
+ j['expected_payload']=str(actual)
+
+ # Existing filesystem object proves presence.
+ # Positive libtorrent progress also proves this worker has observed
+ # verified payload data, which arms later MISSING detection.
+ if actual.exists():
+  j['payload_seen']=True
+
+
+def state_refreshed():
+ live={}
+ with locked_state() as s:
+  for j in s['jobs']:
+   st=live_status(j) if alive(j) else None
+   reconcile_payload(j,st)
+   refresh(j)
+
+   # Re-apply an operator-selected file priority once per worker PID.
+   # The worker may answer PENDING while the metadata approval gate
+   # is still closed; it retains the sequence and activates it when
+   # that existing gate opens.
+   selected=j.get("priority_file_index")
+
+   # Migrate the short-lived sequence UI. Its first native index was
+   # the only file the worker actually promoted to maximum priority.
+   if selected is None and isinstance(j.get("sequence_order"),list):
+    legacy=j.get("sequence_order")
+    if legacy:
+     selected=int(legacy[0])
+     j["priority_file_index"]=selected
+    j.pop("sequence_order",None)
+    j.pop("sequence_applied_pid",None)
+
+   if (
+    alive(j)
+    and st
+    and st.get("metadata")
+    and selected is not None
+    and int(j.get("priority_applied_pid") or 0)
+        != int(j.get("pid") or 0)
+   ):
+    try:
+     priority_command="SEQUENCE "+str(int(selected))
+
+     priority_reply=socket_query(
+      j,
+      priority_command,
+      timeout=3.0
+     )
+
+     if (
+      priority_reply
+      and priority_reply.startswith(
+       "OK\tPRIORITY\t"
+      )
+     ):
+      j["priority_applied_pid"]=int(j["pid"])
+    except Exception:
+     pass
+
+   live[int(j['id'])]=st
+  out=json.loads(json.dumps(s))
+
+ for j in out['jobs']:
+  j['_live_status']=live.get(int(j['id']))
+
+ return out
+
+
+# ============================================================
+# PERMANENT PEER FILTER CONTROL
+#
+# torrent-get-filterd is the sole persistent deny authority
+# and owns nft enforcement.
+#
+# torrent-mgmnt is an operator client only.
+# ============================================================
+
+FILTER_BACKEND_SOCKET=Path(
+    "/run/torrent-get-filterd.sock"
+)
+
+
+def _filter_backend_query(payload):
+    import socket
+
+    if not FILTER_BACKEND_SOCKET.exists():
+        return None
+
+    try:
+        with socket.socket(
+            socket.AF_UNIX,
+            socket.SOCK_STREAM,
+        ) as sock:
+
+            sock.settimeout(3.0)
+
+            sock.connect(
+                str(FILTER_BACKEND_SOCKET)
+            )
+
+            sock.sendall(
+                (
+                    json.dumps(payload)
+                    + "\n"
+                ).encode()
+            )
+
+            raw=b""
+
+            while not raw.endswith(b"\n"):
+                block=sock.recv(65536)
+
+                if not block:
+                    break
+
+                raw+=block
+
+                if len(raw) > 1024*1024:
+                    return None
+
+        if not raw:
+            return None
+
+        reply=json.loads(
+            raw.decode()
+        )
+
+        if not isinstance(reply,dict):
+            return None
+
+        return reply
+
+    except Exception:
+        return None
+
+
+def filter_backend_status():
+    reply=_filter_backend_query(
+        {"cmd":"status"}
+    )
+
+    if (
+        not reply
+        or not reply.get("ok")
+    ):
+        return None
+
+    return reply
+
+
+def filter_control_status():
+    backend=filter_backend_status()
+
+    print()
+    print(
+        "torrent-mgmnt — Permanent Peer Filter"
+    )
+    print()
+
+    if not backend:
+        print("Backend:     UNAVAILABLE")
+        print("Enforcement: UNKNOWN")
+        print()
+        return False
+
+    enforcing=bool(
+        backend.get(
+            "enforcing",
+            False
+        )
+    )
+
+    print("Backend:     NFT")
+    print(
+        "Active sets: "
+        f"{int(backend.get('ipv4',0))} IPv4 / "
+        f"{int(backend.get('ipv6',0))} IPv6"
+    )
+    print(
+        f"Blocked:     "
+        f"{int(backend.get('blocked',0))}"
+    )
+    print(
+        "Generation:  "
+        f"{int(backend.get('generation',0) or 0)}"
+    )
+    print(
+        "Enforcement: "
+        + (
+            "ACTIVE"
+            if enforcing
+            else "INACTIVE"
+        )
+    )
+    print(
+        "Authority:   torrent-get-filterd"
+    )
+
+    try:
+        limiter_pid=subprocess.check_output(
+            [
+                "systemctl",
+                "--user",
+                "show",
+                "torrent-rate-regulator.service",
+                "-p",
+                "MainPID",
+                "--value",
+            ],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+
+        if (
+            limiter_pid.isdigit()
+            and int(limiter_pid) > 0
+        ):
+            print(
+                f"Rate limiter: PID {limiter_pid}"
+            )
+        else:
+            print(
+                "Rate limiter: INACTIVE"
+            )
+
+    except Exception:
+        print(
+            "Rate limiter: UNAVAILABLE"
+        )
+
+    print()
+
+    return enforcing
+
+
+def filter_control_list():
+    reply=_filter_backend_query(
+        {"cmd":"list"}
+    )
+
+    print()
+    print(
+        "torrent-mgmnt — Permanent Blocked Peers"
+    )
+    print()
+
+    if (
+        not reply
+        or not reply.get("ok")
+    ):
+        print("Filter backend unavailable.")
+        print()
+        return False
+
+    ips=reply.get("ips",[])
+
+    if not isinstance(ips,list):
+        ips=[]
+
+    print(
+        "Generation: "
+        f"{int(reply.get('generation',0) or 0)}"
+    )
+    print(
+        f"Blocked:    "
+        f"{int(reply.get('blocked',len(ips)))}"
+    )
+    print()
+
+    if not ips:
+        print("No permanent peer blocks.")
+        print()
+        return True
+
+    for n,ip in enumerate(ips,1):
+        print(f"{n:>4}  {ip}")
+
+    print()
+
+    return True
+
+
+def filter_control_verify():
+    status=_filter_backend_query(
+        {"cmd":"status"}
+    )
+
+    listing=_filter_backend_query(
+        {"cmd":"list"}
+    )
+
+    print()
+
+    if (
+        not status
+        or not status.get("ok")
+        or not listing
+        or not listing.get("ok")
+    ):
+        print(
+            "FAIL: permanent filter backend unavailable"
+        )
+        print()
+        return False
+
+    ips=listing.get("ips",[])
+
+    if not isinstance(ips,list):
+        ips=[]
+
+    blocked=int(
+        listing.get(
+            "blocked",
+            len(ips)
+        )
+    )
+
+    status_blocked=int(
+        status.get(
+            "blocked",
+            -1
+        )
+    )
+
+    ipv4=int(
+        status.get(
+            "ipv4",
+            -1
+        )
+    )
+
+    ipv6=int(
+        status.get(
+            "ipv6",
+            -1
+        )
+    )
+
+    generation=int(
+        status.get(
+            "generation",
+            -1
+        )
+    )
+
+    list_generation=int(
+        listing.get(
+            "generation",
+            -2
+        )
+    )
+
+    ok=(
+        bool(status.get("enforcing"))
+        and blocked == len(ips)
+        and status_blocked == blocked
+        and ipv4 + ipv6 == blocked
+        and generation == list_generation
+    )
+
+    if ok:
+        print(
+            "PASS: native permanent filter authority"
+        )
+        print(
+            f"Generation: {generation}"
+        )
+        print(
+            f"Blocked:    {blocked}"
+        )
+        print(
+            f"IPv4:       {ipv4}"
+        )
+        print(
+            f"IPv6:       {ipv6}"
+        )
+        print(
+            "Enforcing:  YES"
+        )
+    else:
+        print(
+            "FAIL: native permanent filter authority"
+        )
+        print(
+            f"Generation: {generation}"
+        )
+        print(
+            f"Blocked:    {blocked}"
+        )
+        print(
+            f"IPv4:       {ipv4}"
+        )
+        print(
+            f"IPv6:       {ipv6}"
+        )
+        print(
+            "Enforcing:  "
+            + (
+                "YES"
+                if status.get("enforcing")
+                else "NO"
+            )
+        )
+
+    print()
+
+    return ok
+
+
+def filter_control_module():
+    while True:
+        filter_control_status()
+
+        try:
+            choice=input(
+                "s=status, b=blocked, q=back: "
+            ).strip()
+        except (
+            EOFError,
+            KeyboardInterrupt,
+        ):
+            print()
+            return
+
+        if not choice:
+            continue
+
+        lowered=choice.casefold()
+
+        if lowered in {
+            "q","quit","back"
+        }:
+            return
+
+        if lowered in {
+            "s","status"
+        }:
+            continue
+
+        if lowered in {
+            "b","blocked","list"
+        }:
+            filter_control_list()
+
+            try:
+                input("Enter=back: ")
+            except (
+                EOFError,
+                KeyboardInterrupt,
+            ):
+                print()
+
+            continue
+
+        # Hidden diagnostic command.
+        if lowered in {
+            "v","verify"
+        }:
+            filter_control_verify()
+            continue
+
+        print(
+            "Use s=status, b=blocked, or q=back."
+        )
+
+
+def filter_control_direct(args):
+    if not args:
+        filter_control_module()
+        return
+
+    command=str(args[0]).casefold()
+
+    if command in {
+        "s","status"
+    }:
+        filter_control_status()
+        return
+
+    if command in {
+        "b","blocked","list"
+    }:
+        filter_control_list()
+        return
+
+    if command in {
+        "v","verify"
+    }:
+        filter_control_verify()
+        return
+
+    print(
+        "Filter control accepts: status, list, verify."
+    )
+
+
+def _mgmnt_rate(value):
+ v=float(max(0,int(value or 0)))
+ units=['B/s','KiB/s','MiB/s','GiB/s','TiB/s']
+ i=0
+ while v>=1024 and i<len(units)-1:
+  v/=1024
+  i+=1
+ if i==0:
+  return f'{v:.0f} {units[i]}'
+ return f'{v:.1f} {units[i]}'
+
+
+def title_bar(title,rates=None):
+ width=shutil.get_terminal_size((100,24)).columns
+ clock=time.strftime('%I:%M %p').lstrip('0')
+
+ if rates is None:
+  right=clock
+ else:
+  down,up=rates
+  right=(
+   f"↓ {_mgmnt_rate(down)}  "
+   f"↑ {_mgmnt_rate(up)}   "
+   f"{clock}"
+  )
+
+ gap=3
+ if width >= len(title)+len(right)+gap:
+  print(title + ' '*(width-len(title)-len(right)) + right)
+ else:
+  print(title)
+ print('-'*min(width,126))
+
+def listq():
+ print()
+ s=state_refreshed()
+
+ total_down=sum(
+  int((j.get('_live_status') or {}).get('down',0) or 0)
+  for j in s['jobs']
+ )
+ total_up=sum(
+  int((j.get('_live_status') or {}).get('up',0) or 0)
+  for j in s['jobs']
+ )
+
+ title_bar(
+  'torrent-mgmnt — Torrent Management Module',
+  (total_down,total_up),
+ )
+ print(f"{'ID':>3}  {'State':<8}  {'Activity':<11}  {'Progress':>8}  {'Size':>10}  {'PID':>7}  {'Elapsed':>9}  Name"); print('-'*126); now=int(time.time())
+ if not s['jobs']:print('Queue is empty.')
+ for j in s['jobs']:
+  e=max(0,now-int(j['submitted_at'])); h,r=divmod(e,3600); m,sec=divmod(r,60); n=j['name'] if len(j['name'])<=51 else j['name'][:48]+'...'; st=j.get('_live_status')
+  size=human_size(st['size']) if st and st['size'] else '--'; prog=f"{st['progress']*100:.1f}%" if st and st['metadata'] else '--'; act=activity(st,j)
+  pid=display_pid(j)
+  print(f"{j['id']:>3}  {j['state']:<8}  {act:<11}  {prog:>8}  {size:>10}  {pid:>7}  {h:02d}:{m:02d}:{sec:02d}  {n}")
+ print()
+
+def expand(jid):
+ s=state_refreshed(); j=get_job(s,jid)
+ if not j:raise SystemExit(f'Unknown queue job: {jid}')
+ try:v=subprocess.check_output(['pkg-config','--modversion','libtorrent-rasterbar'],text=True,stderr=subprocess.DEVNULL).strip(); v='2.0.10.0' if v=='2.0.10' else v
+ except:v='unknown'
+ print(f"\nJob [{j['id']}] — {j['name']}\nState:       {j['state']}\n\nLaunching certified POSIX baseline...\nDestination: {j['save_path']}\n\nlibtorrent: {v}\nPID:        {j['pid']}\nSave path:  {j['save_path']}\nEngine:     native C++, one libtorrent session\nDisk I/O:   POSIX backend (no mmap)\nInfohash:   {j['infohash'] or '?'}\nLog:        {j['log_path']}")
+ if j.get('systemd_unit'):
+  print('Sandbox:    systemd user transient unit'); print(f"Unit:       {j['systemd_unit']}"); lim=j.get('limits') or {}; print(f"Limits:     MemoryHigh={lim.get('memory_high','?')} MemoryMax={lim.get('memory_max','?')} TasksMax={lim.get('tasks_max','?')} NOFILE={lim.get('nofile','?')}")
+ st=live_status(j)
+ if st:
+  print(f"Metadata:   {'READY' if st['metadata'] else 'WAITING'}"); print(f"Size:       {human_size(st['size'])}"); print(f"Progress:   {st['progress']*100:.1f}%"); print(f"Peers:      {st['peers']} connected / {st['seeds']} seeds")
+ else:print('Metadata:   live interface unavailable'); print('Size:       --')
+ p=Path(j['expected_payload']); print(f"Payload:    {p} ({'present' if p.exists() else ('MISSING' if j.get('payload_seen') else 'not yet confirmed')})\n")
+
+def bar(done,size,width=18):
+ pct=1.0 if size==0 else max(0.0,min(1.0,done/size)); filled=int(round(pct*width)); return '['+'█'*filled+'-'*(width-filled)+']',pct*100
+
+def persist_file_priority(jid,native_index):
+ native_index=int(native_index)
+
+ with locked_state() as s:
+  j=get_job(s,jid)
+  if not j:
+   raise SystemExit(f"Unknown queue job: {jid}")
+
+  if not alive(j):
+   raise SystemExit(
+    f"Job [{jid}] is not active."
+   )
+
+  j["priority_file_index"]=native_index
+  j["priority_applied_pid"]=None
+  j.pop("sequence_order",None)
+  j.pop("sequence_applied_pid",None)
+  snapshot=json.loads(json.dumps(j))
+
+ raw=socket_query(
+  snapshot,
+  "SEQUENCE "+str(native_index),
+  timeout=10.0
+ )
+
+ if not raw:
+  raise SystemExit("Live file-priority interface unavailable.")
+
+ if raw.startswith("ERROR\t"):
+  raise SystemExit(
+   raw.strip().split("\t",1)[1]
+  )
+
+ if not raw.startswith("OK\tPRIORITY\t"):
+  raise SystemExit(
+   "Unexpected file-priority response."
+  )
+
+ with locked_state() as s:
+  j=get_job(s,jid)
+  if j and int(j.get("pid") or 0)==int(snapshot.get("pid") or 0):
+   j["priority_applied_pid"]=int(snapshot["pid"])
+
+ return raw.strip()
+
+def clear_file_priority(jid,reset_worker=True):
+ was_alive=False
+ had_priority=False
+ with locked_state() as s:
+  j=get_job(s,jid)
+  if not j:
+   raise SystemExit(f"Unknown queue job: {jid}")
+  was_alive=alive(j)
+  had_priority=(
+   j.get("priority_file_index") is not None
+   or bool(j.get("sequence_order"))
+  )
+  j.pop("priority_file_index",None)
+  j.pop("priority_applied_pid",None)
+  j.pop("sequence_order",None)
+  j.pop("sequence_applied_pid",None)
+
+ # The worker's established single-file command atomically resets all
+ # priorities before setting MAX, but has no separate reset command.
+ # A controlled checkpoint/restart is therefore the only supported way
+ # to restore every file to libtorrent's normal priority.
+ if reset_worker and was_alive and had_priority:
+  pause_many([jid])
+  resume(jid)
+
+
+def contents(jid):
+ while _contents_view(jid):
+  pass
+
+
+def _contents_view(jid):
+ s=state_refreshed(); j=get_job(s,jid)
+ if not j:raise SystemExit(f'Unknown queue job: {jid}')
+ if not alive(j):raise SystemExit(f"Job [{jid}] is not active. Resume it before requesting live contents progress.")
+ raw=socket_query(j,'FILES',timeout=10.0)
+ if not raw:raise SystemExit('Live contents interface unavailable.')
+ if raw.startswith('ERROR\t'):
+  reason=raw.strip().split('\t',1)[1]
+  if reason.casefold()=='metadata unavailable':
+   raise SystemExit('Metadata is not READY yet.')
+  raise SystemExit(reason)
+
+ # FILES is emitted by the worker in native libtorrent file-index
+ # order. Preserve that index before presentation sorting.
+ files=[]
+ for line in raw.splitlines():
+  x=line.split('\t',3)
+  if len(x)==4 and x[0]=='FILE':
+   try:
+    native_index=len(files)
+    files.append(
+     (
+      native_index,
+      x[3],
+      int(x[1]),
+      int(x[2])
+     )
+    )
+   except:
+    pass
+
+ if not files:raise SystemExit('Live contents manifest is empty.')
+
+ st=live_status(j)
+ total_size=sum(size for _,_,size,_ in files)
+ total_done=sum(done for _,_,_,done in files)
+ progress=(
+  st['progress']
+  if st
+  else (1.0 if total_size==0 else total_done/total_size)
+ )
+ torrent_size=st['size'] if st else total_size
+
+ folders=defaultdict(lambda:[0,0])
+ for _,path,size,done in files:
+  parts=Path(path).parts
+  for i in range(1,len(parts)):
+   folder=str(Path(*parts[:i]))+'/'
+   folders[folder][0]+=size
+   folders[folder][1]+=done
+
+ rows=[]
+ for folder,(size,done) in folders.items():
+  rows.append((folder,size,done,'DIR',None))
+
+ for native_index,path,size,done in files:
+  rows.append(
+   (
+    path,
+    size,
+    done,
+    'FILE',
+    native_index
+   )
+  )
+
+ rows.sort(
+  key=lambda r:(
+   r[0].lower(),
+   0 if r[3]=='DIR' else 1
+  )
+ )
+
+ selected_native=j.get("priority_file_index")
+ selected_file=next(
+  (
+   row for row in rows
+   if row[3]=='FILE' and row[4]==selected_native
+  ),
+  None
+ )
+
+ # A priority selection is never handed on to another file. Once its
+ # verified size is complete, remove the persisted designation.
+ if (
+  selected_file is not None
+  and selected_file[1]>=0
+  and selected_file[2]>=selected_file[1]
+ ):
+  clear_file_priority(jid,reset_worker=False)
+  selected_native=None
+
+ print(f"\nJob [{j['id']}] — {j['name']}")
+ print(f"Magnet #:  {j.get('infohash') or '--'}")
+ print(f"Progress: {progress*100:.1f}% of {human_size(torrent_size)}")
+ print(
+  "Download: "
+  + (
+   human_size(st["down"]) + "/s"
+   if st
+   else "--"
+  )
+ )
+ print('\n Contents (verified piece progress)')
+ print('-'*118)
+ print(
+  f"{'#':>3} {'Pri':<3} "
+  f"{'Progress':<27} "
+  f"{'Done / Size':>24}  "
+  f"Type  Path"
+ )
+ print('-'*118)
+
+ display_indices=[]
+ record=0
+
+ for path,size,done,kind,native_index in rows:
+  b,pct=bar(done,size)
+  amount=f"{human_size(done)} / {human_size(size)}"
+
+  if kind=='FILE':
+   record+=1
+   rec=f"{record:>3}"
+   display_indices.append(native_index)
+  else:
+   rec="   "
+
+  priority=(
+   "MAX"
+   if kind=='FILE' and native_index==selected_native
+   else ""
+  )
+
+  print(
+   f"{rec} {priority:<3} "
+   f"{b} {pct:6.1f}% "
+   f"{amount:>24}  "
+   f"{kind:<4}  "
+   f"{path}"
+  )
+
+ print()
+
+ # Preserve non-interactive `torrent-mgmnt contents ...` behavior.
+ # Selector is exposed by the established interactive contents view.
+ if os.environ.get(
+  "TORRENT_MGMNT_INTERNAL_CONTENTS"
+ )!="1":
+  return
+
+ while True:
+  try:
+   choice=input(
+    "r=refresh, s [record]=select priority file, "
+    "c=clear priority, p=peers, q=back: "
+   ).strip()
+  except (EOFError,KeyboardInterrupt):
+   print()
+   return
+
+  if not choice:
+   continue
+
+  if choice.casefold() in {"q","quit","back"}:
+   return
+
+  if choice.casefold() in {"r","refresh"}:
+   return True
+
+  if choice.casefold() in {"p","peers"}:
+   env=os.environ.copy()
+   env["TORRENT_PEERS_RETURN_TO_CONTENTS"]="1"
+   subprocess.run(
+    [str(HOME/".local/bin/torrent-peers"),str(jid)],
+    env=env,
+    check=False,
+   )
+   return True
+
+  if choice.casefold() in {"c","clear"}:
+   clear_file_priority(jid)
+   print("File priority cleared.")
+   return True
+
+  parts=choice.split()
+
+  if len(parts)!=2 or parts[0].casefold()!="s":
+   print("Use r, s [record], c, p, or q.")
+   continue
+
+  try:
+   selected=int(parts[1])
+  except ValueError:
+   print("Contents record must be numeric.")
+   continue
+
+  if selected<1 or selected>len(display_indices):
+   print(
+    f"Contents record must be 1-{len(display_indices)}."
+   )
+   continue
+
+  selected_native=display_indices[selected-1]
+  selected_row=next(
+   row for row in rows
+   if row[3]=='FILE' and row[4]==selected_native
+  )
+
+  if selected_row[2]>=selected_row[1]:
+   print(f"Record {selected} is already complete.")
+   continue
+
+  try:
+   persist_file_priority(jid,selected_native)
+  except SystemExit as exc:
+   print(exc)
+   continue
+
+  print(f"Record {selected} selected for maximum priority.")
+  return True
+
+def remove_many(ids,delete_payload=False):
+ ids=validate_job_ids(ids)
+
+ if not ids:
+  raise SystemExit(
+   'remove requires one or more job IDs'
+  )
+
+ removed=[]
+ failed=[]
+ jobs={}
+ original_states={}
+ active_ids=set()
+
+ # ---------------------------------------------------------
+ # ONE queue transaction:
+ #
+ #   - resolve every requested job
+ #   - refresh each once
+ #   - snapshot ownership
+ #   - advertise REMOVING for live workers
+ #
+ # No repeated state acquisition per job.
+ # ---------------------------------------------------------
+ with locked_state() as state:
+
+  for jid in ids:
+   job=get_job(state,jid)
+
+   if not job:
+    failed.append(jid)
+
+    print(
+     f"Job [{jid}]: REMOVE FAILED — "
+     "queue record unavailable."
+    )
+
+    continue
+
+   refresh(job)
+
+   original_states[jid]=job.get(
+    'state'
+   )
+
+   is_live=alive(job)
+   jobs[jid]=dict(job)
+
+   if is_live:
+    active_ids.add(jid)
+    job['state']='REMOVING'
+
+ # Nothing valid to process.
+ if not jobs:
+  if len(ids)>1:
+   print()
+   print(
+    f"Removed: 0 | Failed: {len(failed)}"
+   )
+
+  return
+
+ # ---------------------------------------------------------
+ # Stop all queue-owned workers in ONE systemctl operation.
+ #
+ # Existing remove semantics do not treat a systemctl return
+ # code as removal authority; teardown verification remains
+ # in the normal lifecycle below.
+ # ---------------------------------------------------------
+ units=[]
+
+ for jid,job in jobs.items():
+  if jid not in active_ids:
+   continue
+
+  units.append(
+   job.get('systemd_unit')
+   or f'torrent-worker-{jid}.service'
+  )
+
+ if units:
+  subprocess.run(
+   [
+    'systemctl',
+    '--user',
+    'stop',
+    *units,
+   ],
+   stdout=subprocess.DEVNULL,
+   stderr=subprocess.DEVNULL,
+   check=False
+  )
+
+ successful=set()
+
+ # ---------------------------------------------------------
+ # Per-job filesystem/security teardown.
+ #
+ # No queue-state locks occur in this loop.
+ # ---------------------------------------------------------
+ for jid in ids:
+
+  job=jobs.get(jid)
+
+  if job is None:
+   continue
+
+  payload_deleted=not delete_payload
+  payload_reason=None
+
+  # Resolve payload only when deletion was actually requested.
+  if delete_payload:
+   payload=safe_target(job)
+
+   if payload is None:
+    payload_reason="unsafe payload path"
+
+   else:
+    try:
+     if (
+      payload.is_symlink()
+      or payload.is_file()
+     ):
+      payload.unlink()
+      payload_deleted=True
+
+     elif payload.is_dir():
+      shutil.rmtree(payload)
+      payload_deleted=True
+
+     elif not payload.exists():
+      payload_deleted=True
+
+     else:
+      payload_reason=(
+       "unsupported payload filesystem object"
+      )
+
+    except Exception as exc:
+     payload_reason=str(exc)
+
+  # Requested payload deletion is transactional with removal:
+  # failure retains queue identity/recovery ownership.
+  if not payload_deleted:
+   reason=(
+    payload_reason
+    or "payload deletion failed"
+   )
+
+   failed.append(jid)
+
+   print(
+    f"Job [{jid}]: NOT REMOVED — "
+    f"payload deletion FAILED ({reason}); "
+    "recovery state retained."
+   )
+
+   continue
+
+  resume_file=(
+   RESUME_DIR
+   / f"job-{jid}.fastresume"
+  )
+
+  try:
+   resume_file.unlink()
+
+  except FileNotFoundError:
+   pass
+
+  except OSError as exc:
+   failed.append(jid)
+
+   print(
+    f"Job [{jid}]: NOT REMOVED — "
+    "unable to retire fast-resume "
+    f"({exc})."
+   )
+
+   continue
+
+  try:
+   retire_metadata_approval(job)
+
+  except Exception as exc:
+   failed.append(jid)
+
+   print(
+    f"Job [{jid}]: NOT REMOVED — "
+    "unable to retire metadata approval "
+    f"({exc})."
+   )
+
+   continue
+
+  successful.add(jid)
+  removed.append(jid)
+
+ # ---------------------------------------------------------
+ # ONE final queue transaction:
+ #
+ #   - delete successful identities together
+ #   - restore unsuccessful jobs from REMOVING
+ #
+ # This replaces one queue rewrite per job.
+ # ---------------------------------------------------------
+ with locked_state() as state:
+
+  if successful:
+   state['jobs']=[
+    job
+    for job in state['jobs']
+    if int(job['id']) not in successful
+   ]
+
+  for jid in failed:
+   current=get_job(state,jid)
+
+   if (
+    current
+    and current.get('state')=='REMOVING'
+   ):
+    current['state']=original_states.get(
+     jid,
+     'STOPPED'
+    )
+
+ # Operator output remains per requested job.
+ for jid in ids:
+
+  if jid not in successful:
+   continue
+
+  if delete_payload:
+   print(
+    f"Job [{jid}]: REMOVED — "
+    "payload deleted."
+   )
+  else:
+   print(
+    f"Job [{jid}]: REMOVED — "
+    "payload retained."
+   )
+
+ if len(ids)>1:
+  print()
+  print(
+   f"Removed: {len(removed)} | "
+   f"Failed: {len(failed)}"
+  )
+
+
+def prune(jid=None):
+ # A queue record must never relinquish ownership of a live worker.
+ inactive={'EXITED','STOPPED','ORPHANED','MISSING','PAUSED'}
+
+ with locked_state() as s:
+  for j in s['jobs']:
+   refresh(j)
+
+  if jid is None:
+   targets=[
+    int(j['id'])
+    for j in s['jobs']
+    if j.get('state') in inactive
+   ]
+  else:
+   j=get_job(s,jid)
+
+   if not j:
+    raise SystemExit(f'Unknown queue job: {jid}')
+
+   if j.get('state') not in inactive:
+    raise SystemExit(
+     f"Job [{jid}] is {j.get('state')}; "
+     "only inactive records can be pruned."
+    )
+
+   targets=[int(jid)]
+
+ # Snapshot queue identities before permanent teardown.
+ with locked_state() as state:
+  target_set=set(
+   int(x)
+   for x in targets
+  )
+
+  retiring_jobs={
+   int(job['id']):dict(job)
+   for job in state['jobs']
+   if int(job['id']) in target_set
+  }
+
+ # Stop ownership BEFORE deleting any record.
+ for target in targets:
+  unit=f'torrent-worker-{target}.service'
+
+  subprocess.run(
+   ['systemctl','--user','stop',unit],
+   stdout=subprocess.DEVNULL,
+   stderr=subprocess.DEVNULL,
+   check=False
+  )
+
+ # Only after shutdown may recovery, approval, and queue
+ # identities disappear.
+ for target in targets:
+  target=int(target)
+
+  resume_file=RESUME_DIR/f"job-{target}.fastresume"
+
+  try:
+   resume_file.unlink()
+  except FileNotFoundError:
+   pass
+  except OSError as exc:
+   raise SystemExit(
+    f"Unable to retire fast-resume for job [{target}]: {exc}"
+   )
+
+  retiring_job=retiring_jobs.get(target)
+
+  if retiring_job is None:
+   raise SystemExit(
+    f"Unable to retire metadata approval for job [{target}]: "
+    "queue identity unavailable"
+   )
+
+  try:
+   retire_metadata_approval(
+    retiring_job
+   )
+  except Exception as exc:
+   raise SystemExit(
+    f"Unable to retire metadata approval for job [{target}]: {exc}"
+   )
+
+ with locked_state() as s:
+  before=len(s['jobs'])
+
+  if jid is None:
+   target_set=set(targets)
+   s['jobs']=[
+    j for j in s['jobs']
+    if int(j['id']) not in target_set
+   ]
+
+   print(
+    f"Pruned {before-len(s['jobs'])} inactive queue record(s)."
+   )
+  else:
+   s['jobs']=[
+    j for j in s['jobs']
+    if int(j['id']) != int(jid)
+   ]
+
+   print(
+    f"Pruned queue record [{jid}]. "
+    "Payload and logs were not touched."
+   )
+
+
+def validate_job_ids(ids):
+ if not ids:return []
+ ids=list(dict.fromkeys(int(x) for x in ids))
+ with locked_state() as s:
+  known={int(j['id']) for j in s['jobs']}
+ missing=[jid for jid in ids if jid not in known]
+ if missing:
+  raise SystemExit(
+   'Unknown queue job(s): ' + ' '.join(str(x) for x in missing)
+  )
+ return ids
+
+
+
+def network_pause_read():
+ if not NETWORK_PAUSE_STATE.exists():
+  return {"paused":False,"jobs":[]}
+
+ try:
+  raw=json.loads(NETWORK_PAUSE_STATE.read_text())
+
+  return {
+   "paused":bool(raw.get("paused",False)),
+   "jobs":[int(x) for x in raw.get("jobs",[])]
+  }
+
+ except Exception:
+  # Invalid breaker state fails closed.
+  return {"paused":True,"jobs":[]}
+
+
+def network_pause_write(paused,jobs):
+ NETWORK_PAUSE_STATE.parent.mkdir(
+  parents=True,
+  exist_ok=True
+ )
+
+ tmp=NETWORK_PAUSE_STATE.with_name(
+  NETWORK_PAUSE_STATE.name+".tmp"
+ )
+
+ tmp.write_text(
+  json.dumps(
+   {
+    "paused":bool(paused),
+    "jobs":[int(x) for x in jobs]
+   },
+   indent=2,
+   sort_keys=True
+  )+"\n"
+ )
+
+ os.replace(tmp,NETWORK_PAUSE_STATE)
+
+
+def network_paused():
+ return bool(network_pause_read()["paused"])
+
+
+def pause_many(ids):
+ ids=validate_job_ids(ids)
+
+ # No IDs means all currently active jobs.
+ if not ids:
+  with locked_state() as state:
+   targets=[]
+
+   for job in state['jobs']:
+    refresh(job)
+
+    if alive(job):
+     targets.append(int(job['id']))
+
+  ids=targets
+
+ if not ids:
+  print('No running jobs to pause.')
+  return
+
+ paused=[]
+
+ for jid in ids:
+
+  with locked_state() as state:
+   job=get_job(state,jid)
+
+   if not job:
+    raise SystemExit(f'Unknown queue job: {jid}')
+
+   refresh(job)
+
+   if not alive(job):
+    if job.get('state') in {'PAUSED','STOPPED'}:
+     # Normalize any legacy retained state.
+     job['state']='PAUSED'
+     paused.append(jid)
+     continue
+
+    raise SystemExit(
+     f"Job [{jid}] is {job.get('state')}; "
+     "only running jobs can be paused."
+    )
+
+   unit=(
+    job.get('systemd_unit')
+    or f'torrent-worker-{jid}.service'
+   )
+
+   job['state']='PAUSING'
+   checkpoint_before=int(job.get('checkpoint_generation') or 0)
+
+  # Direct worker shutdown.
+  subprocess.run(
+   ['systemctl','--user','stop',unit],
+   stdout=subprocess.DEVNULL,
+   stderr=subprocess.DEVNULL,
+   check=False
+  )
+
+  with locked_state() as state:
+   job=get_job(state,jid)
+
+   if not job:
+    raise SystemExit(
+     f'Job [{jid}] disappeared during pause.'
+    )
+
+   refresh(job)
+   if alive(job):
+    job['state']='RECOVERABLE'
+    job['recovery_reason']='worker did not stop within systemd timeout'
+   elif (job.get('checkpoint_valid') and
+         int(job.get('checkpoint_generation') or 0)>checkpoint_before):
+    job['state']='PAUSED'
+    job.pop('recovery_reason',None)
+   else:
+    job['state']='RECOVERABLE'
+    job['recovery_reason']='no durable resume checkpoint confirmed'
+   job['last_checked']=int(time.time())
+
+  if job.get('state')=='PAUSED':paused.append(jid)
+  else:print(f"Job [{jid}] stopped in RECOVERABLE state; no final checkpoint was confirmed.")
+
+ if len(paused)==1:
+  print(
+   f"Job [{paused[0]}] paused. "
+   "Payload retained."
+  )
+ else:
+  joined=' '.join(str(x) for x in paused)
+
+  print(
+   f"SYSTEM PAUSED — {len(paused)} job(s) "
+   f"[{joined}]. Payloads retained."
+  )
+
+def resume_many(ids):
+ if not ids:
+  resume_all(); return
+ for jid in validate_job_ids(ids):
+  resume(jid)
+
+
+def expand_many(ids):
+ for jid in validate_job_ids(ids):
+  expand(jid)
+
+
+def contents_many(ids):
+ for jid in validate_job_ids(ids):
+  contents(jid)
+
+
+
+def _gate_magnet(value):
+    value=str(value or "").strip()
+
+    if value.casefold().startswith("urn:btih:"):
+        return value[9:]
+
+    return value
+
+
+def _gate_events():
+    """
+    Read TG_GATE evidence directly from existing per-job logs.
+
+    No collector, socket, diagnostic IPC, or secondary viewer process.
+    """
+    events=[]
+
+    try:
+        state=state_refreshed()
+    except Exception:
+        return events
+
+    for job in state.get("jobs",[]):
+        log_path=job.get("log_path")
+
+        if not log_path:
+            continue
+
+        path=Path(log_path)
+
+        if not path.is_file():
+            continue
+
+        try:
+            with path.open(
+                "r",
+                encoding="utf-8",
+                errors="replace",
+            ) as handle:
+
+                for line in handle:
+
+                    marker="TG_GATE\t"
+                    pos=line.find(marker)
+
+                    if pos<0:
+                        continue
+
+                    raw=line[pos+len(marker):].strip()
+
+                    try:
+                        record=json.loads(raw)
+                    except Exception:
+                        continue
+
+                    if isinstance(record,dict):
+                        events.append(record)
+
+        except Exception:
+            continue
+
+    events.sort(
+        key=lambda x:str(x.get("ts",""))
+    )
+
+    return events
+
+
+def _gate_transactions(events):
+    rows=[]
+    current=None
+
+    for event in events:
+
+        name=str(
+            event.get("event","")
+        ).upper()
+
+        if name=="RECEIVED":
+
+            if current is not None:
+                rows.append(current)
+
+            current={
+                "time":event.get("ts",""),
+                "result":"PENDING",
+                "store":"--",
+                "manifest":"--",
+                "approval":"--",
+                "ms":None,
+                "magnet":_gate_magnet(
+                    event.get("torrent_id","")
+                ),
+            }
+
+            continue
+
+        if current is None:
+            current={
+                "time":event.get("ts",""),
+                "result":"PENDING",
+                "store":"--",
+                "manifest":"--",
+                "approval":"--",
+                "ms":None,
+                "magnet":_gate_magnet(
+                    event.get("torrent_id","")
+                ),
+            }
+
+        if not current["magnet"]:
+            current["magnet"]=_gate_magnet(
+                event.get("torrent_id","")
+            )
+
+        if name=="STORE_MATCH":
+            current["store"]="MATCH"
+
+        elif name=="STORE_MISSING":
+            current["store"]="NEW"
+
+        elif name=="STORE_MISMATCH":
+            current["store"]="FAIL"
+
+        elif name=="MANIFEST_MATCH":
+            current["manifest"]="MATCH"
+
+        elif name=="MANIFEST_MISMATCH":
+            current["manifest"]="FAIL"
+
+        elif name=="APPROVAL_REUSED":
+            current["approval"]="REUSED"
+
+        elif name=="APPROVAL_NEW":
+            current["approval"]="NEW"
+
+        elif name in {
+            "PAYLOAD_UNDECLARED",
+            "PAYLOAD_MISSING",
+            "PAYLOAD_SPECIAL",
+        }:
+            current["manifest"]="FAIL"
+
+        if name=="GATE_RELEASE":
+            current["result"]="ALLOW"
+            current["ms"]=event.get("elapsed_ms")
+            rows.append(current)
+            current=None
+
+        elif name=="GATE_DENY":
+            current["result"]="DENY"
+            current["ms"]=event.get("elapsed_ms")
+            rows.append(current)
+            current=None
+
+    if current is not None:
+        rows.append(current)
+
+    return rows
+
+
+def _gate_time(value):
+    value=str(value or "")
+
+    if not value:
+        return "--"
+
+    try:
+        from datetime import datetime
+
+        dt=datetime.fromisoformat(
+            value.replace("Z","+00:00")
+        )
+
+        return dt.astimezone().strftime(
+            "%H:%M:%S"
+        )
+
+    except Exception:
+        return value[:8]
+
+
+def gatekeeper_log_module():
+
+    page=0
+    live=True
+
+    page_size=max(
+        5,
+        shutil.get_terminal_size(
+            (120,24)
+        ).lines-8,
+    )
+
+    last_signature=None
+
+    while True:
+
+        events=_gate_events()
+        rows=_gate_transactions(events)
+
+        signature=(
+            len(events),
+            json.dumps(
+                events[-1],
+                sort_keys=True,
+                default=str,
+            )
+            if events
+            else "",
+        )
+
+        pages=max(
+            1,
+            (len(rows)+page_size-1)//page_size,
+        )
+
+        if live:
+            page=pages-1
+
+        if signature!=last_signature:
+
+            if sys.stdout.isatty():
+                print("\033[2J\033[H",end="")
+
+            width=shutil.get_terminal_size(
+                (120,24)
+            ).columns
+
+            mode=(
+                "LIVE"
+                if live and page==pages-1
+                else f"HISTORY {page+1}/{pages}"
+            )
+
+            print(
+                "torrent-mgmnt — Gatekeeper Traffic — "
+                + mode
+            )
+
+            print("-"*min(width,145))
+
+            print(
+                f"{'Time':<9} "
+                f"{'Result':<7} "
+                f"{'Store':<9} "
+                f"{'Manifest':<9} "
+                f"{'Approval':<9} "
+                f"{'ms':>7}  "
+                f"Magnet #"
+            )
+
+            print("-"*min(width,145))
+
+            start=page*page_size
+            end=min(
+                len(rows),
+                start+page_size,
+            )
+
+            for row in rows[start:end]:
+
+                elapsed=row.get("ms")
+
+                ms=(
+                    "--"
+                    if elapsed is None
+                    else f"{float(elapsed):.1f}"
+                )
+
+                print(
+                    f"{_gate_time(row.get('time')):<9} "
+                    f"{row.get('result','--'):<7} "
+                    f"{row.get('store','--'):<9} "
+                    f"{row.get('manifest','--'):<9} "
+                    f"{row.get('approval','--'):<9} "
+                    f"{ms:>7}  "
+                    f"{row.get('magnet') or '--'}"
+                )
+
+            print()
+
+            print(
+                f"Transactions "
+                f"{start+1 if rows else 0}-{end} "
+                f"of {len(rows)}"
+            )
+
+            print(
+                "p=previous, n=next, l=live, "
+                "r=refresh, q=back"
+            )
+
+            last_signature=signature
+
+        try:
+            ready,_,_=select.select(
+                [sys.stdin],
+                [],
+                [],
+                0.5,
+            )
+
+        except Exception:
+            ready=[]
+
+        if not ready:
+            continue
+
+        choice=sys.stdin.readline()
+
+        if choice=="":
+            return
+
+        choice=choice.strip().casefold()
+
+        if choice in {"q","quit","exit"}:
+            return
+
+        if choice in {"l","live"}:
+            live=True
+            last_signature=None
+            continue
+
+        if choice.strip().casefold() in {"con","config","configure"}:
+            configure_download_folder()
+            continue
+
+        if choice in {"r","refresh"}:
+            last_signature=None
+            continue
+
+        if choice in {"p","previous","prev"}:
+            live=False
+            page=max(0,page-1)
+            last_signature=None
+            continue
+
+        if choice in {"n","next"}:
+
+            if page<pages-1:
+                page+=1
+                live=False
+            else:
+                live=True
+
+            last_signature=None
+            continue
+
+
+def blocked_peers_log_module():
+    """
+    Live persistent blocked-peer view under Diagnostic Logs.
+
+    torrent-get-filterd remains the sole persistent deny authority.
+    Existing peer-control code remains the unblock mutation path.
+    """
+
+    while True:
+        reply=_filter_backend_query(
+            {"cmd":"list"}
+        )
+
+        print()
+        print(
+            "torrent-mgmnt — Blocked Peers"
+        )
+        print()
+
+        if (
+            not reply
+            or not reply.get("ok")
+        ):
+            print("Filter backend unavailable.")
+            print()
+
+            try:
+                choice=input(
+                    "r=refresh, q=back: "
+                ).strip().casefold()
+            except (
+                EOFError,
+                KeyboardInterrupt,
+            ):
+                print()
+                return
+
+            if choice in {
+                "q","quit","back","exit"
+            }:
+                return
+
+            continue
+
+        ips=reply.get("ips",[])
+
+        if not isinstance(ips,list):
+            ips=[]
+
+        ips=[
+            str(ip).strip()
+            for ip in ips
+            if str(ip).strip()
+        ]
+
+        records=[
+            (number,ip)
+            for number,ip in enumerate(ips,1)
+        ]
+        found_records=[]
+
+        print(
+            f"Set: {len(records)}/4096 | "
+            f"Capacity: {max(0,4096-len(records))}"
+        )
+        print()
+
+        if not records:
+            print("No permanent peer blocks.")
+            print()
+
+        else:
+            for number,ip in records:
+                print(
+                    f"{number:>4}  {ip}"
+                )
+
+            print()
+
+        #
+        # Stay inside this command loop.
+        #
+        # The complete list is printed again ONLY
+        # when the operator explicitly requests refresh.
+        #
+        while True:
+            try:
+                choice=input(
+                    "u RECORD...=unblock, trim found, "
+                    "d=delete log contents, "
+                    "f=find, r=refresh, q=back: "
+                ).strip()
+            except (
+                EOFError,
+                KeyboardInterrupt,
+            ):
+                print()
+                return
+
+            if not choice:
+                continue
+
+            parts=choice.split()
+            command=parts[0].casefold()
+
+            if command in {
+                "q","quit","back","exit"
+            }:
+                return
+
+            if command in {
+                "r","refresh"
+            }:
+                break
+
+            if command in {
+                "f","find"
+            }:
+                if len(parts)==1:
+                    try:
+                        needle=input(
+                            "Find IP: "
+                        ).strip()
+                    except (
+                        EOFError,
+                        KeyboardInterrupt,
+                    ):
+                        print()
+                        continue
+
+                else:
+                    needle=" ".join(
+                        parts[1:]
+                    ).strip()
+
+                if not needle:
+                    print("Find cancelled.")
+                    print()
+                    continue
+
+                matches=[
+                    (number,ip)
+                    for number,ip in records
+                    if needle.casefold()
+                    in ip.casefold()
+                ]
+                found_records=matches
+
+                print()
+
+                if matches:
+                    print(
+                        f"FOUND: {needle}"
+                    )
+                    print()
+
+                    for number,ip in matches:
+                        print(
+                            f"{number:>4}  {ip}"
+                        )
+
+                else:
+                    print(
+                        f"NOT FOUND: {needle}"
+                    )
+
+                print()
+
+                #
+                # Stay here.
+                # Do NOT redraw the complete list.
+                #
+                continue
+
+            if command=="trim":
+                if len(parts)!=2 or parts[1].casefold()!="found":
+                    print("Usage: trim found")
+                    continue
+                if not found_records:
+                    print("No current find results to trim.")
+                    continue
+                if len(found_records)>256:
+                    print("Trim exceeds the 256-record batch limit; narrow the find.")
+                    continue
+                selected_ips=[ip for _,ip in found_records]
+                answer=input(
+                    f"Trim {len(selected_ips)} found block(s)? Type trim to confirm: "
+                ).strip().casefold()
+                if answer!="trim":
+                    print("Trim cancelled.")
+                    continue
+                result=_filter_backend_query(
+                    {"cmd":"unblock_many","ips":selected_ips}
+                )
+                if not result or not result.get("ok"):
+                    print("Trim failed: " + str((result or {}).get("error","backend unavailable")))
+                    continue
+                print(f"Trimmed {len(result.get('changed',[]))} persistent block(s).")
+                break
+
+            if command in {"d","delete"}:
+                if not records:
+                    print("No permanent peer blocks.")
+                    continue
+                answer=input(
+                    f"Delete all {len(records)} blocked-peer log records "
+                    "and unblock every IP? Type delete to confirm: "
+                ).strip().casefold()
+                if answer!="delete":
+                    print("Delete cancelled.")
+                    continue
+                failure=None
+                removed=0
+                all_ips=[ip for _,ip in records]
+                for start in range(0,len(all_ips),256):
+                    result=_filter_backend_query(
+                        {"cmd":"unblock_many","ips":all_ips[start:start+256]}
+                    )
+                    if not result or not result.get("ok"):
+                        failure=str((result or {}).get("error","backend unavailable"))
+                        break
+                    removed+=len(result.get("changed",[]))
+                print(f"Deleted {removed} blocked-peer log record(s).")
+                if failure:
+                    print("Delete stopped: " + failure)
+                break
+
+            if command not in {
+                "u","unblock"
+            }:
+                print(
+                    "Use u RECORD...=unblock, trim found, "
+                    "d=delete log contents, f=find, r=refresh, q=back."
+                )
+                continue
+
+            if not records:
+                print(
+                    "No permanent peer blocks."
+                )
+                continue
+
+            if len(parts)==1:
+                try:
+                    raw=input(
+                        "Record number to unblock: "
+                    ).strip()
+                except (
+                    EOFError,
+                    KeyboardInterrupt,
+                ):
+                    print()
+                    continue
+
+            else:
+                raw=" ".join(parts[1:])
+
+            numbers=[]
+            try:
+                for token in raw.replace(","," ").split():
+                    if "-" in token:
+                        first,last=(int(item) for item in token.split("-",1))
+                        if first>last:
+                            raise ValueError
+                        numbers.extend(range(first,last+1))
+                    else:
+                        numbers.append(int(token))
+            except ValueError:
+                print("Invalid record selection.")
+                continue
+            numbers=list(dict.fromkeys(numbers))
+            if not numbers or len(numbers)>256 or any(n<1 or n>len(records) for n in numbers):
+                print("Invalid record selection or 256-record batch limit exceeded.")
+                continue
+            selected_ips=[records[n-1][1] for n in numbers]
+            result=_filter_backend_query(
+                {"cmd":"unblock_many","ips":selected_ips}
+            )
+            if not result or not result.get("ok"):
+                print("Unable to unblock: " + str((result or {}).get("error","backend unavailable")))
+                continue
+
+            #
+            # Certify against the persistent authority.
+            #
+            verify=_filter_backend_query(
+                {"cmd":"list"}
+            )
+
+            verify_ips=(
+                verify.get("ips",[])
+                if (
+                    verify
+                    and verify.get("ok")
+                )
+                else None
+            )
+
+            if (
+                isinstance(verify_ips,list)
+                and not set(selected_ips) & {
+                    str(item).strip()
+                    for item in verify_ips
+                }
+            ):
+                print(
+                    f"Unblocked {len(selected_ips)} persistent block(s)."
+                )
+                break
+
+            else:
+                print(
+                    f"Unblock not confirmed "
+                    f"for {ip}."
+                )
+
+
+
+def diagnostic_logs_module():
+    """
+    Diagnostic branch point.
+
+    New diagnostics can be added here without new processes.
+    """
+
+    while True:
+
+        width=shutil.get_terminal_size(
+            (100,24)
+        ).columns
+
+        print()
+        print(
+            "torrent-mgmnt — Diagnostic Logs"
+        )
+
+        print("-"*min(width,100))
+        print()
+        print("1  Gatekeeper Traffic — live")
+        print("2  Blocked Peers — live")
+        print()
+        print("q  back")
+        print()
+
+        try:
+            choice=input(
+                "logs: "
+            ).strip().casefold()
+
+        except (
+            EOFError,
+            KeyboardInterrupt,
+        ):
+            print()
+            return
+
+        if choice in {"q","quit","exit"}:
+            return
+
+        if choice in {"1","gate","gatekeeper"}:
+            gatekeeper_log_module()
+            continue
+
+        if choice in {
+            "2","blocked","blocks","peers"
+        }:
+            blocked_peers_log_module()
+            continue
+
+        print(
+            "Use 1=Gatekeeper Traffic, "
+            "2=Blocked Peers, or q=back."
+        )
+
+
+def management_module():
+    """
+    Persistent operator control center.
+
+    Bare `torrent-queue` enters here.
+    Explicit subcommands retain normal one-shot CLI behavior.
+    """
+    while True:
+        listq()
+
+        try:
+            choice=input(
+                "r=refresh, rm [ids]=remove, c [ids]=contents, pr [ids]=prune, p=peers, f=filter, con=configure, l=logs, m=maintenance, q=quit: "
+            ).strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+
+        # Direct space-delimited management commands.
+        # These are handled HERE, before legacy dispatch.
+        parts=choice.split()
+
+        # DIRECT CONFIGURATION COMMAND
+        #
+        # Configuration belongs entirely to torrent-mgmnt.
+        # Consume it here so it can never fall through to
+        # torrent-queue argparse.
+        if (
+            parts
+            and parts[0].casefold()
+            in {"con","config","configure"}
+        ):
+            if len(parts)!=1:
+                print(
+                    "Usage: con"
+                )
+                continue
+
+            configure_download_folder()
+            continue
+
+
+        if len(parts)>1:
+            direct_cmd=parts[0].casefold()
+
+            # DIRECT PEER VIEW
+            #
+            #   p 294
+            #   peers 294
+            #   p all
+            #
+            # Bare `p` retains the established interactive prompt.
+            if direct_cmd in {"p","peers"}:
+
+                if len(parts)!=2:
+                    print(
+                        "Peer view accepts one numeric job ID or 'all'."
+                    )
+                    continue
+
+                target=parts[1].strip()
+
+                if target.casefold()=="all":
+                    target="all"
+
+                else:
+                    try:
+                        jid=int(target)
+                    except ValueError:
+                        print(
+                            "Peer view accepts one numeric job ID or 'all'."
+                        )
+                        continue
+
+                    if jid < 1:
+                        print(
+                            "Peer view requires a positive job ID."
+                        )
+                        continue
+
+                    try:
+                        validate_job_ids([jid])
+                    except SystemExit as exc:
+                        print(exc)
+                        continue
+
+                    target=str(jid)
+
+                # Replace Management with the existing Peer Control
+                # process. Peer Control `q` already returns directly
+                # to torrent-mgmnt.
+                if not PEERS.is_file() or not os.access(PEERS,os.X_OK):
+                    raise SystemExit(
+                        f"torrent-peers is not executable: {PEERS}"
+                    )
+                os.execv(
+                    str(PEERS),
+                    [
+                        str(PEERS),
+                        target,
+                    ],
+                )
+
+            if direct_cmd in {"c","contents","rm","remove","pr","prune"}:
+                direct_args=parts[1:]
+                inline_remove_answer=None
+
+                # Hidden inline-answer grammar:
+                #
+                #   rm 373 n
+                #   rm 373 y
+                #   rm 373 382 n
+                #   rm 373 382 y
+                #
+                # The final y/n token answers only the existing
+                # payload-removal confirmation. Without it, existing
+                # prompt behavior is unchanged.
+                if (
+                    direct_cmd in {"rm","remove"}
+                    and direct_args
+                    and direct_args[-1].casefold()
+                    in {"y","yes","n","no"}
+                ):
+                    inline_remove_answer=(
+                        direct_args[-1].casefold()
+                    )
+                    direct_args=direct_args[:-1]
+
+                try:
+                    direct_ids=_parse_numeric_selection(direct_args)
+                except ValueError:
+                    print("Invalid job ID selection.")
+                    continue
+
+                if direct_cmd in {"c","contents"}:
+                    try:
+                        os.environ[
+                            "TORRENT_MGMNT_INTERNAL_CONTENTS"
+                        ]="1"
+
+                        contents_many(direct_ids)
+
+                    finally:
+                        os.environ.pop(
+                            "TORRENT_MGMNT_INTERNAL_CONTENTS",
+                            None
+                        )
+
+                    continue
+
+                if direct_cmd in {"rm","remove"}:
+                    if not direct_ids:
+                        print(
+                            "Remove requires at least one numeric job ID."
+                        )
+                        continue
+
+                    count=len(direct_ids)
+                    noun='torrent' if count==1 else 'torrents'
+
+                    if inline_remove_answer is not None:
+                        answer=inline_remove_answer
+                    else:
+                        try:
+                            answer=input(
+                                f"Remove payloads for all {count} {noun}? [y/N]: "
+                            ).strip().casefold()
+                        except (EOFError,KeyboardInterrupt):
+                            print()
+                            answer=''
+
+                    remove_payload=(
+                        answer in {"y","yes"}
+                    )
+
+                    remove_many(
+                        direct_ids,
+                        delete_payload=remove_payload,
+                    )
+                    continue
+
+                if direct_cmd in {"pr","prune"}:
+                    for jid in direct_ids:
+                        prune(jid)
+                    continue
+
+        if not choice:
+            continue
+
+        lowered=choice.casefold()
+
+        qparts=choice.split()
+
+        if (
+            qparts
+            and qparts[0].casefold()
+            in {"f","filter"}
+        ):
+            filter_control_direct(
+                qparts[1:]
+            )
+            continue
+
+        if lowered in {"l","logs"}:
+            diagnostic_logs_module()
+            continue
+
+        if lowered in {"m","maint","maintenance"}:
+            maint_operator_module()
+            continue
+
+        qparts=choice.split()
+
+        if (
+            qparts
+            and qparts[0].casefold() in {"q","quit","exit"}
+        ):
+            # Hidden inline-answer grammar:
+            #
+            #   q
+            #   q y
+            #   q n
+            #   q y n
+            #
+            # The first answer belongs to Management.
+            # A valid third token is consumed as the chained answer,
+            # allowing both confirmations to be typed at once.
+            #
+            # Management itself acts only on the first answer.
+            # The chained answer must never invalidate q y.
+            inline_answers=[
+                part.casefold()
+                for part in qparts[1:]
+            ]
+
+            valid_answers={"y","yes","n","no"}
+
+            if (
+                1 <= len(inline_answers) <= 2
+                and all(
+                    answer in valid_answers
+                    for answer in inline_answers
+                )
+            ):
+                answer=inline_answers[0]
+
+                chained_answer=(
+                    inline_answers[1]
+                    if len(inline_answers)==2
+                    else None
+                )
+
+            else:
+                chained_answer=None
+
+                try:
+                    answer=input(
+                        "Quit Torrent Management? y/n: "
+                    ).strip().casefold()
+                except (EOFError,KeyboardInterrupt):
+                    print()
+                    continue
+
+            if answer in {"y","yes"}:
+                return
+
+            # n/no keeps Management open regardless of any
+            # pre-supplied chained answer.
+            continue
+
+        if lowered in {"r","refresh"}:
+            continue
+
+        if lowered in {"pr","prune"}:
+            try:
+                raw_id=input(
+                    "Prune job ID, or Enter for all eligible: "
+                ).strip()
+            except (EOFError,KeyboardInterrupt):
+                print()
+                continue
+
+            if raw_id:
+                try:
+                    jid=int(raw_id)
+                except ValueError:
+                    print(
+                        "Prune accepts one numeric job ID, "
+                        "or Enter for all eligible."
+                    )
+                    continue
+
+                prune_args=[
+                    "prune",
+                    str(jid),
+                ]
+            else:
+                prune_args=[
+                    "prune",
+                ]
+
+            old_argv=sys.argv[:]
+
+            try:
+                os.environ[
+                    "TORRENT_MGMNT_INTERNAL_PRUNE"
+                ]="1"
+
+                sys.argv=[
+                    os.path.abspath(__file__),
+                    *prune_args,
+                ]
+
+                main()
+
+            except SystemExit as exc:
+                if exc.code not in (None,0):
+                    print(exc)
+
+            finally:
+                os.environ.pop(
+                    "TORRENT_MGMNT_INTERNAL_PRUNE",
+                    None
+                )
+                sys.argv=old_argv
+
+            print()
+
+            # Return directly to the refreshed management list.
+            continue
+
+        if lowered in {"p","peers"}:
+            try:
+                target=input(
+                    "Peer view — job ID, or Enter for all: "
+                ).strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                continue
+
+            if not target or target.casefold()=="all":
+                # ALL peers remain in the torrent-mgmnt foreground.
+                _peer_all_foreground()
+                continue
+
+            try:
+                job_id=int(target)
+            except ValueError:
+                print(
+                    "Peer view accepts one numeric job ID "
+                    "or Enter for all."
+                )
+                continue
+
+            if job_id < 1:
+                print(
+                    "Peer view requires a positive job ID."
+                )
+                continue
+
+            # p ID deliberately remains unchanged.
+            #
+            # Existing torrent-peers job-scoped interface takes over,
+            # and its q path returns to torrent-mgmnt as before.
+            if not PEERS.is_file() or not os.access(PEERS,os.X_OK):
+                raise SystemExit(
+                    f"torrent-peers is not executable: {PEERS}"
+                )
+            os.execv(
+                str(PEERS),
+                [
+                    str(PEERS),
+                    str(job_id),
+                ],
+            )
+
+        if lowered in {"c","contents"}:
+            try:
+                raw_id=input(
+                    "Contents job ID: "
+                ).strip()
+            except (EOFError,KeyboardInterrupt):
+                print()
+                continue
+
+            if not raw_id:
+                continue
+
+            try:
+                jid=int(raw_id)
+            except ValueError:
+                print(
+                    "Contents requires one numeric job ID."
+                )
+                continue
+
+            old_argv=sys.argv[:]
+
+            try:
+                os.environ[
+                    "TORRENT_MGMNT_INTERNAL_CONTENTS"
+                ]="1"
+
+                sys.argv=[
+                    os.path.abspath(__file__),
+                    "contents",
+                    str(jid),
+                ]
+
+                main()
+
+            except SystemExit as exc:
+                if exc.code not in (None,0):
+                    print(exc)
+
+            finally:
+                os.environ.pop(
+                    "TORRENT_MGMNT_INTERNAL_CONTENTS",
+                    None
+                )
+                sys.argv=old_argv
+
+            print()
+
+            # Return directly to the refreshed management list.
+            continue
+
+        if lowered == "rm":
+            try:
+                raw_ids=input(
+                    "Remove job ID(s): "
+                ).strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                continue
+
+            if not raw_ids:
+                continue
+
+            try:
+                ids=_parse_numeric_selection(raw_ids)
+            except ValueError:
+                print(
+                    "Remove accepts numeric job IDs and ranges."
+                )
+                continue
+
+            try:
+                try:
+                    payload_choice=input(
+                        "Delete payload(s)? y/n: "
+                    ).strip().casefold()
+                except (EOFError,KeyboardInterrupt):
+                    print()
+                    continue
+                if payload_choice in {"y","yes"}:
+                    delete_payload=True
+                elif payload_choice in {"n","no"}:
+                    delete_payload=False
+                else:
+                    print("Enter y or n.")
+                    continue
+
+                remove_many(
+                    ids,
+                    delete_payload=delete_payload
+                )
+            except SystemExit as exc:
+                print(exc)
+                continue
+
+            # Removal completed through the existing lifecycle:
+            # stop owned worker -> delete queue record -> retain payload.
+            # Return directly to the refreshed management list.
+            continue
+
+        try:
+            args=shlex.split(choice)
+        except ValueError as exc:
+            print(f"Input error: {exc}")
+            continue
+
+        if not args:
+            continue
+
+        # Bare management mode remains the parent control center.
+        # Existing torrent-queue commands execute through the exact
+        # same one-shot command surface already used from Bash.
+        try:
+            result=subprocess.run(
+                [
+                    sys.executable,
+                    os.path.abspath(__file__),
+                    *args,
+                ],
+                check=False,
+            )
+        except OSError as exc:
+            print(f"Unable to execute torrent-queue action: {exc}")
+            continue
+
+        if result.returncode != 0:
+            print(
+                f"Action returned status {result.returncode}."
+            )
+
+        print()
+
+
+
+def _peer_backend(args,env=None):
+    command=[
+        str(
+            Path.home()
+            / ".local/bin/torrent-peers"
+        ),
+        *args,
+    ]
+
+    run_env=os.environ.copy()
+    run_env["COLUMNS"]=str(
+        shutil.get_terminal_size((100,24)).columns
+    )
+
+    if env:
+        run_env.update(env)
+
+    result=subprocess.run(
+        command,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=run_env,
+    )
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            result.stderr.strip()
+            or result.stdout.strip()
+            or "torrent-peers backend failed"
+        )
+
+    return result.stdout
+
+
+# Maintenance is deliberately self-contained in torrent-mgmnt.  In
+# particular, these commands run before normal queue reconciliation so the
+# read-only operations cannot create directories, lock files, or state writes.
+TORRENT_GET_STATE=HOME/".local/share/torrent-get"
+TORRENT_GET_CACHE=HOME/".cache/torrent-get"
+
+MAINT_PROTECTED=(
+ TORRENT_GET_CONFIG,
+ TORRENT_GET_STATE/"geoip",
+ METADATA_APPROVAL_ROOT,
+ TORRENT_GET_STATE/"security",
+ TORRENT_GET_STATE/"peer-observation",
+ NETWORK_PAUSE_STATE,
+ STATE_FILE,
+ LOCK_FILE,
+ LOG_DIR,
+ RESUME_DIR,
+)
+
+_MAINT_ARTIFACT_DIR=re.compile(r".+-[0-9]{8}-[0-9]{6}$")
+_MAINT_ARTIFACT_FILE=re.compile(
+ r"(?:torrent-(?:get|mgmnt|queue|peers|worker-posix|approval-bridge)|"
+ r"magnet-search)(?:\.(?:pre|before|candidate|live-before|new|logs|"
+ r"native-logs|nft-only|approval-v1|approval-v1-regressed|"
+ r"pre-production-bake|pre-import-shell-guard|pre-magnet-import-cleanup|"
+ r"pre-foreground-softfail|pre-infohash-dedupe|pre-logs-blocked-peers|"
+ r"pre-magnet-cleanup|pre-magnet-only|pre-native-filter|"
+ r"pre-remove-many-opt|pre-runtime-bake|pre-batch-filter|"
+ r"pre-remove-observed|pre-nft-only-certified|pre-none-pid-fix))"
+ r"(?:-[0-9]{8}(?:-[0-9]{6})?)?$"
+)
+
+
+def _maint_size(path):
+ try:
+  if path.is_symlink() or path.is_file():
+   return path.lstat().st_size
+  return sum(
+   item.lstat().st_size
+   for item in path.rglob("*")
+   if item.is_file() or item.is_symlink()
+  )
+ except OSError:
+  return 0
+
+
+def _maint_clean_candidates():
+ """Return only names whose shape proves they are build/backup leftovers."""
+ candidates=[]
+ try:
+  children=list(TORRENT_GET_STATE.iterdir())
+ except OSError:
+  children=[]
+
+ for path in children:
+  if path in MAINT_PROTECTED:
+   continue
+  if path.is_dir() and _MAINT_ARTIFACT_DIR.fullmatch(path.name):
+   candidates.append(path)
+  elif path.is_file() and _MAINT_ARTIFACT_FILE.fullmatch(path.name):
+   candidates.append(path)
+
+ return sorted(candidates,key=lambda item:item.name)
+
+
+def _maint_inventory():
+ candidates=_maint_clean_candidates()
+ queue={"readable":False,"jobs":None,"live_jobs":None}
+ try:
+  state=json.loads(STATE_FILE.read_text())
+  jobs=state.get("jobs",[])
+  queue={
+   "readable":True,
+   "jobs":len(jobs),
+   "live_jobs":sum(
+    1 for job in jobs
+    if alive(job) or systemd_main_pid(
+     job.get("systemd_unit")
+     or f"torrent-worker-{job.get('id')}.service"
+    ) not in (None,0)
+   ),
+  }
+ except Exception:
+  pass
+
+ return {
+  "queue":queue,
+  "clean_candidates":len(candidates),
+  "clean_bytes":sum(_maint_size(path) for path in candidates),
+  "protected":{
+   str(path):path.exists()
+   for path in MAINT_PROTECTED
+  },
+  "logs":{
+   "files":len(_maint_logs()),
+   "bytes":sum(_maint_size(path) for _,path in _maint_logs()),
+  },
+ }
+
+
+def maint_audit():
+ print("torrent-mgmnt maint audit (read-only)")
+ print(json.dumps(_maint_support_report(),indent=2,sort_keys=True))
+
+
+def maint_clean(apply=False):
+ candidates=_maint_clean_candidates()
+ print(
+  "torrent-mgmnt maint clean — "
+  + ("EXECUTING" if apply else "Items to be cleaned")
+ )
+
+ if not candidates:
+  print("No proven disposable torrent-get-owned state found.")
+  return
+
+ failures=[]
+ for path in candidates:
+  size=_maint_size(path)
+  print(f"{'REMOVE' if apply else 'ITEM'}\t{size}\t{path}")
+  if not apply:
+   continue
+  try:
+   if path.is_dir() and not path.is_symlink():
+    shutil.rmtree(path)
+   else:
+    path.unlink()
+  except OSError as exc:
+   failures.append((path,exc))
+
+ if failures:
+  for path,exc in failures:
+   print(f"FAILED\t{path}\t{exc}",file=sys.stderr)
+  raise SystemExit(1)
+
+ print(
+  f"{'Removed' if apply else 'Candidates'}: {len(candidates)} | "
+  f"Bytes: {sum(_maint_size(path) for path in candidates) if not apply else 'reported above'}"
+ )
+
+
+def _maint_clear_contents(root):
+ if not root.exists():
+  return 0
+ if root.is_symlink() or not root.is_dir():
+  raise RuntimeError(f"refusing non-directory live-state root: {root}")
+ removed=0
+ for child in list(root.iterdir()):
+  if child.is_dir() and not child.is_symlink():
+   shutil.rmtree(child)
+  else:
+   child.unlink()
+  removed+=1
+ return removed
+
+
+def maint_flush(selection=None):
+ if selection is None:
+  print("torrent-mgmnt maint flush")
+  for number,(name,(description,roots)) in enumerate(
+   MAINT_FLUSH_CLASSES.items(),1
+  ):
+   entries=sum(
+    1 for root in roots
+    for _ in (root.iterdir() if root.is_dir() else ())
+   )
+   print(f"{number}  {name} — {description} ({entries} entries)")
+  try:
+   raw=input("Select exactly one class, or q to cancel: ").strip()
+  except (EOFError,KeyboardInterrupt):
+   print()
+   return
+  if raw.casefold() in {"q","quit","exit"}:
+   return
+  names=list(MAINT_FLUSH_CLASSES)
+  if raw.isdigit() and 1 <= int(raw) <= len(names):
+   selection=names[int(raw)-1]
+  else:
+   selection=raw
+
+ if selection not in MAINT_FLUSH_CLASSES:
+  raise SystemExit(
+   "flush requires exactly one of: "
+   + ", ".join(MAINT_FLUSH_CLASSES)
+  )
+
+ description,roots=MAINT_FLUSH_CLASSES[selection]
+ removed=sum(_maint_clear_contents(root) for root in roots)
+ print(f"Flushed {selection}: {removed} entries cleared ({description}).")
+
+
+def _maint_logs():
+ logs=[]
+ for label,root in (
+  ("queue",LOG_DIR),("security",TORRENT_GET_STATE/"security/logs")
+ ):
+  if not root.is_dir():
+   continue
+  for path in sorted(root.rglob("*"),key=lambda item:str(item)):
+   if path.is_file() and not path.is_symlink():
+    logs.append((label,path))
+ return logs
+
+
+def _maint_log_view(path):
+ limit=256*1024
+ with path.open("rb") as handle:
+  handle.seek(0,os.SEEK_END)
+  size=handle.tell()
+  clipped=size>limit
+  handle.seek(max(0,size-limit),os.SEEK_SET)
+  content=handle.read().decode("utf-8",errors="replace")
+ if clipped:
+  content="[showing latest 256 KiB]\n"+content
+ return _maint_redact(content).rstrip() or "[empty log]"
+
+
+def _maint_flush_log(path):
+ allowed={candidate.resolve() for _,candidate in _maint_logs()}
+ target=path.resolve()
+ if target not in allowed or path.is_symlink() or not path.is_file():
+  raise RuntimeError("refusing unowned or non-regular log file")
+ fd=os.open(target,os.O_WRONLY|os.O_TRUNC)
+ try:
+  os.fsync(fd)
+ finally:
+  os.close(fd)
+
+
+def _maint_flush_all_logs():
+ logs=list(_maint_logs())
+ cleared=[]
+ failures=[]
+ for _,path in logs:
+  try:
+   _maint_flush_log(path)
+   cleared.append(path.name)
+  except Exception as exc:
+   failures.append((path.name,str(exc)))
+ return cleared,failures
+
+
+def _maint_file_facts(path):
+ try:
+  st=path.lstat()
+  facts={
+   "exists":True,
+   "type":"directory" if path.is_dir() else "file",
+   "mode":oct(st.st_mode & 0o777),
+   "size":st.st_size,
+   "mtime":time.strftime(
+    "%Y-%m-%dT%H:%M:%SZ",time.gmtime(st.st_mtime)
+   ),
+  }
+  if path.is_file() and not path.is_symlink() and st.st_size<=10*1024*1024:
+   facts["sha256"]=hashlib.sha256(path.read_bytes()).hexdigest()
+  return facts
+ except OSError as exc:
+  return {"exists":False,"error":str(exc)}
+
+
+def _maint_command(command):
+ try:
+  result=subprocess.run(
+   command,text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,
+   timeout=5,check=False,
+  )
+  return {
+   "status":result.returncode,
+   "output":_maint_redact(result.stdout.strip()),
+  }
+ except Exception as exc:
+  return {"error":str(exc)}
+
+
+def _maint_redact(value):
+ text=str(value)
+ text=re.sub(r"magnet:\?\S+","<redacted-magnet>",text)
+ return text.replace(str(HOME),"~")
+
+
+def _maint_current_logs():
+ result={}
+ roots={
+  "queue":LOG_DIR,
+  "security":TORRENT_GET_STATE/"security/logs",
+ }
+ for label,root in roots.items():
+  if not root.is_dir():
+   result[label]=None
+   continue
+  files=[
+   path for path in root.iterdir()
+   if path.is_file() and not path.is_symlink()
+  ]
+  result[label]=max(
+   files,key=lambda path:path.stat().st_mtime
+  ).name if files else None
+ return result
+
+
+def _maint_disk_facts(path):
+ try:
+  usage=shutil.disk_usage(path)
+  return {"total":usage.total,"used":usage.used,"free":usage.free}
+ except OSError as exc:
+  return {"error":str(exc)}
+
+
+def _maint_memory_facts():
+ wanted={"MemTotal","MemAvailable","SwapTotal","SwapFree"}
+ result={}
+ try:
+  for line in Path("/proc/meminfo").read_text().splitlines():
+   key,_,value=line.partition(":")
+   if key in wanted:
+    result[key]=value.strip()
+ except OSError as exc:
+  result["error"]=str(exc)
+ return result
+
+
+def _maint_support_report():
+ inventory=_maint_inventory()
+ inventory["protected"].pop(
+  str(TORRENT_GET_STATE/"peer-observation"),None
+ )
+ software_paths=(
+  Path(__file__).resolve(),
+  HOME/".local/bin/torrent-get",
+  HOME/".local/bin/torrent-peers",
+  HOME/".local/bin/magnet-search",
+  HOME/".local/libexec/torrent-worker-posix",
+  HOME/".local/libexec/torrent-approval-bridge",
+  HOME/".local/lib/torrent-get/security/approval_store.py",
+  HOME/".config/systemd/user/torrent-rate-regulator.service",
+ )
+ report={
+  "generated_at":time.strftime("%Y-%m-%dT%H:%M:%SZ",time.gmtime()),
+  "program":str(Path(__file__).resolve()),
+  "python":sys.version.split()[0],
+  "system":{
+   "platform":sys.platform,
+   "uname":list(os.uname()),
+   "boot_id":boot_id(),
+   "memory":_maint_memory_facts(),
+   "systemd":_maint_command(["systemctl","--version"]),
+  },
+  "inventory":inventory,
+  "software":{
+   str(path):_maint_file_facts(path)
+   for path in software_paths
+  },
+  "state_paths":{
+   str(path):_maint_file_facts(path)
+   for path in (
+    TORRENT_GET_CONFIG,NETWORK_PAUSE_STATE,STATE_FILE,LOCK_FILE,
+    LOG_DIR,RESUME_DIR,METADATA_APPROVAL_ROOT,
+    TORRENT_GET_STATE/"security/logs",TORRENT_GET_CACHE,
+   )
+  },
+  "storage":{
+   str(path):_maint_disk_facts(path)
+   for path in {
+    HOME,STATE_DIR,TORRENT_GET_STATE,_configured_download_folder(),
+   }
+  },
+ }
+ try:
+  state=json.loads(STATE_FILE.read_text())
+  report["queue_next_id"]=state.get("next_id")
+  report["queue_jobs"]=[
+   {
+    "id":job.get("id"),
+    "state":job.get("state"),
+    "alive":(
+     alive(job)
+     or systemd_main_pid(
+      job.get("systemd_unit")
+      or f"torrent-worker-{job.get('id')}.service"
+     ) not in (None,0)
+    ),
+    "systemd_unit":job.get("systemd_unit"),
+    "pid":job.get("pid"),
+    "pid_start":job.get("pid_start"),
+    "save_path":_maint_redact(job.get("save_path","")),
+    "checkpoint":checkpoint_status(job),
+    "activity":activity(job.get("state"),job),
+   }
+   for job in state.get("jobs",[])
+  ]
+ except Exception as exc:
+  report["queue_error"]=str(exc)
+ try:
+  report["network_pause"]=json.loads(NETWORK_PAUSE_STATE.read_text())
+ except Exception as exc:
+  report["network_pause_error"]=str(exc)
+ report["current_log_files"]=_maint_current_logs()
+ units=["torrent-rate-regulator.service"]+[
+  job.get("systemd_unit") or f"torrent-worker-{job.get('id')}.service"
+  for job in state.get("jobs",[])
+ ] if "state" in locals() else ["torrent-rate-regulator.service"]
+ report["service_state"]={
+  unit:_maint_command([
+   "systemctl","--user","show",unit,
+   "--property=Id,LoadState,ActiveState,SubState,MainPID,ExecMainStatus,"
+   "MemoryCurrent,TasksCurrent,CPUUsageNSec,StateChangeTimestamp",
+  ])
+  for unit in units
+ }
+ return report
+
+
+def maint_dump():
+ stamp=time.strftime("%Y%m%d-%H%M%S",time.localtime())
+ destination=HOME/f"torrent-mgmnt-dump-{stamp}-{os.getpid()}.json"
+ report=_maint_support_report()
+
+ payload=(json.dumps(report,indent=2,sort_keys=True)+"\n").encode()
+ fd=os.open(destination,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+ try:
+  offset=0
+  while offset<len(payload):
+   offset+=os.write(fd,payload[offset:])
+  os.fsync(fd)
+ finally:
+  os.close(fd)
+ print("Support dump created:")
+ print(f"  {destination}")
+ print()
+ print("Submit this file for investigation.")
+
+
+def _maint_capture(action,*args):
+ output=io.StringIO()
+ try:
+  with contextlib.redirect_stdout(output),contextlib.redirect_stderr(output):
+   action(*args)
+ except SystemExit as exc:
+  if exc.code not in (None,0):
+   print(exc,file=output)
+ return output.getvalue().rstrip()
+
+
+def _maint_redraw(title,body,commands):
+ if sys.stdout.isatty():
+  print("\033[2J\033[H",end="")
+ width=min(shutil.get_terminal_size((100,24)).columns,100)
+ print(
+  f"torrent-mgmnt — Maintenance — {title}"
+  if title else "torrent-mgmnt — Maintenance"
+ )
+ print("-"*width)
+ print()
+ if body:
+  print(body)
+ print()
+ print("-"*width)
+ print(commands)
+ print()
+
+
+def maint_operator_module():
+ """Persistent maintenance view; q always moves one level back."""
+ view="main"
+ notice=""
+ dump_result="Select d to generate a new support dump file."
+ selected_log=None
+
+ while True:
+  logs=_maint_logs()
+  job_logs=[item for item in logs if item[0]=="queue"]
+  if view=="main":
+   title=""
+   body=""
+   commands="a=audit  c=clean  l=logs  d=dump  e=exit"
+  elif view=="audit":
+   title="Audit"
+   body=_maint_capture(maint_audit)
+   commands="a=audit  c=clean  l=logs  d=dump  r=refresh  q=back"
+  elif view=="clean":
+   title="Clean"
+   body=_maint_capture(maint_clean,False)
+   commands="x=execute clean  l=logs  d=dump  r=refresh  q=back"
+  elif view=="logs":
+   title="Logs"
+   body=""
+   commands="1=Gatekeeper Traffic  2=Blocked Peers  3=Job Logs  f=flush all  q=back"
+  elif view=="job-logs":
+   title="Job Logs"
+   rows=[]
+   for number,(_,path) in enumerate(job_logs,1):
+    facts=_maint_file_facts(path)
+    rows.append(
+     f"{number:>3}  {path.name:<40} "
+     f"{facts.get('size',0):>10} bytes  {facts.get('mtime','?')}"
+    )
+   body="\n".join(rows) or "No job logs found."
+   commands="[number]=view log  r=refresh  q=back"
+  elif view=="log":
+   if selected_log is None or not selected_log.exists():
+    view="logs"
+    notice="Selected log is no longer available."
+    continue
+   title=f"Log — {selected_log.name}"
+   body=_maint_log_view(selected_log)
+   commands="f=flush this log  r=refresh  q=back"
+  else:
+   title="Support Dump"
+   body=dump_result
+   commands="a=audit  c=clean  l=logs  d=new dump  r=refresh  q=back"
+
+  if notice:
+   body=f"{notice}\n\n{body}"
+   notice=""
+  _maint_redraw(title,body,commands)
+
+  try:
+   choice=input("maint: ").strip().casefold()
+  except (EOFError,KeyboardInterrupt):
+   print()
+   choice="e"
+
+  if view=="main" and choice in {"e","exit"}:
+   return "management"
+
+  if choice in {"q","quit"}:
+   if view=="log":
+    view="job-logs"
+   elif view=="job-logs":
+    view="logs"
+   elif view!="main":
+    view="main"
+   continue
+  if choice in {"a","audit"}:
+   view="audit"
+   continue
+  if choice in {"c","clean"}:
+   view="clean"
+   continue
+  if choice in {"l","logs"}:
+   view="logs"
+   continue
+  if choice in {"d","dump"}:
+   dump_result=_maint_capture(maint_dump)
+   view="dump"
+   continue
+  if choice in {"r","refresh",""}:
+   continue
+
+  if view=="logs" and choice=="1":
+   gatekeeper_log_module()
+   continue
+  if view=="logs" and choice=="2":
+   blocked_peers_log_module()
+   continue
+  if view=="logs" and choice=="3":
+   view="job-logs"
+   continue
+  if view=="logs" and choice in {"f","flush"}:
+   try:
+    answer=input(
+     f"Clear all {len(logs)} logs? Type flush to confirm: "
+    ).strip()
+   except (EOFError,KeyboardInterrupt):
+    print()
+    answer=""
+   if answer.casefold()!="flush":
+    notice="Flush all cancelled; no logs were cleared."
+   else:
+    cleared,failures=_maint_flush_all_logs()
+    notice=f"Flushed {len(cleared)} log(s)."
+    if failures:
+     notice+=(
+      f" Failed: {len(failures)} — "
+      + "; ".join(f"{name}: {reason}" for name,reason in failures)
+     )
+   continue
+
+  if view=="job-logs" and choice.isdigit():
+   number=int(choice)
+   if 1<=number<=len(job_logs):
+    selected_log=job_logs[number-1][1]
+    view="log"
+   else:
+    notice="Unknown log number."
+   continue
+
+  if view=="log" and choice in {"f","flush"}:
+   try:
+    answer=input(
+     f"Clear {selected_log.name}? Type flush to confirm: "
+    ).strip()
+   except (EOFError,KeyboardInterrupt):
+    print()
+    answer=""
+   if answer.casefold()!="flush":
+    notice="Log flush cancelled; nothing was cleared."
+   else:
+    try:
+     _maint_flush_log(selected_log)
+     notice=f"Flushed log: {selected_log.name}"
+    except Exception as exc:
+     notice=f"Log flush failed: {exc}"
+   continue
+
+  if view=="clean" and choice in {"x","execute"}:
+   try:
+    answer=input(
+     "Remove every displayed clean candidate? Type clean to confirm: "
+    ).strip()
+   except (EOFError,KeyboardInterrupt):
+    print()
+    answer=""
+   if answer.casefold()!="clean":
+    notice="Clean cancelled; nothing was removed."
+   else:
+    notice=_maint_capture(maint_clean,True) or "Clean completed."
+   continue
+
+  if view!="main":
+   notice="Selection not available in this view."
+
+
+def maint_module(argv):
+ if not argv:
+  if maint_operator_module()=="management":
+   management_module()
+  return
+
+ parser=argparse.ArgumentParser(prog="torrent-mgmnt maint")
+ sub=parser.add_subparsers(dest="action",required=True)
+ sub.add_parser("audit",help="inspect maintenance state without changes")
+ clean=sub.add_parser("clean",help="remove proven disposable owned state")
+ clean.add_argument(
+  "--apply",action="store_true",
+  help="remove the displayed items",
+ )
+ sub.add_parser("dump",help="emit a read-only support dump")
+ args=parser.parse_args(argv)
+ if args.action=="audit":
+  maint_audit()
+ elif args.action=="clean":
+  maint_clean(args.apply)
+ else:
+  maint_dump()
+
+
+def _peer_parse_row_selection(values,count):
+    selected=_parse_numeric_selection(values)
+
+    invalid=[
+        value
+        for value in selected
+        if value<1 or value>count
+    ]
+
+    if invalid:
+        raise IndexError(
+            " ".join(
+                str(value)
+                for value in invalid
+            )
+        )
+
+    return selected
+
+
+def _peer_global_rates_foreground():
+    while True:
+        print()
+
+        try:
+            choice=input(
+                "Global rate control — "
+                "d=download, u=upload, "
+                "s=show, q=back: "
+            ).strip()
+
+        except (EOFError,KeyboardInterrupt):
+            print()
+            return
+
+        if not choice:
+            continue
+
+        command=choice.casefold()
+
+        if command in {"q","quit","back"}:
+            return
+
+        if command in {"s","show"}:
+            try:
+                raw=_peer_backend(
+                    ["__mgmt-rates"]
+                ).strip()
+
+                rates=json.loads(raw)
+
+                print()
+                print("Global rate limits")
+                print(
+                    "Download: "
+                    + (
+                        human_size(
+                            int(rates.get("down",0))
+                        )
+                        + "/s"
+                        if int(
+                            rates.get("down",0)
+                        ) > 0
+                        else "unlimited"
+                    )
+                )
+                print(
+                    "Upload:   "
+                    + (
+                        human_size(
+                            int(rates.get("up",0))
+                        )
+                        + "/s"
+                        if int(
+                            rates.get("up",0)
+                        ) > 0
+                        else "unlimited"
+                    )
+                )
+
+            except Exception as exc:
+                print(exc)
+
+            continue
+
+        if command not in {
+            "d","download",
+            "u","upload",
+        }:
+            print(
+                "Use d=download, u=upload, "
+                "s=show, q=back."
+            )
+            continue
+
+        direction=(
+            "down"
+            if command in {"d","download"}
+            else "up"
+        )
+
+        try:
+            rate=input(
+                f"{direction.title()} rate "
+                "(e.g. 500K, 2M, 0=unlimited): "
+            ).strip()
+
+        except (EOFError,KeyboardInterrupt):
+            print()
+            continue
+
+        if not rate:
+            continue
+
+        result=subprocess.run(
+            [
+                str(
+                    Path.home()
+                    / ".local/bin/torrent-peers"
+                ),
+                "limit",
+                direction,
+                rate,
+                "all",
+            ],
+            text=True,
+        )
+
+        if result.returncode != 0:
+            print(
+                "Rate update failed."
+            )
+
+
+def _peer_blocked_foreground():
+    while True:
+        try:
+            raw=_peer_backend(
+                ["__mgmt-blocks"]
+            )
+
+            ips=[
+                line.strip()
+                for line in raw.splitlines()
+                if line.strip()
+            ]
+
+        except Exception as exc:
+            print(
+                f"Blocked-peer list unavailable — {exc}"
+            )
+            return
+
+        print()
+        print("Persistent globally blocked peers")
+        print()
+
+        if not ips:
+            print("No blocked peers.")
+        else:
+            for number,ip in enumerate(
+                ips,
+                1
+            ):
+                print(
+                    f"{number:>3}  {ip}"
+                )
+
+        print()
+
+        try:
+            choice=input(
+                "u [IP]=unblock, "
+                "r=refresh, q=back: "
+            ).strip()
+
+        except (EOFError,KeyboardInterrupt):
+            print()
+            return
+
+        if not choice:
+            continue
+
+        parts=choice.split()
+        command=parts[0].casefold()
+        values=parts[1:]
+
+        if command in {"q","quit","back"}:
+            return
+
+        if command in {"r","refresh"}:
+            continue
+
+        if command in {"u","unblock"}:
+            if len(values)!=1:
+                print(
+                    "Usage: u IP"
+                )
+                continue
+
+            try:
+                raw=_peer_backend(
+                    [
+                        "__mgmt-unblock",
+                        values[0],
+                    ]
+                ).strip()
+
+            except Exception as exc:
+                print(exc)
+                continue
+
+            parts=raw.split(
+                "\t",
+                1
+            )
+
+            if (
+                len(parts)==2
+                and parts[0]=="UNBLOCKED"
+            ):
+                print(
+                    f"Unblocked: {parts[1]}"
+                )
+            else:
+                print(raw)
+
+            continue
+
+        print(
+            "u [IP]=unblock, "
+            "r=refresh, q=back."
+        )
+
+
+def _peer_all_foreground():
+    while True:
+        try:
+            raw=_peer_backend(
+                ["all"],
+                env={
+                    "TORRENT_PEERS_MGMT_SNAPSHOT":"1"
+                },
+            )
+
+        except Exception as exc:
+            print(
+                f"All-peer view unavailable — {exc}"
+            )
+            return
+
+        marker="__TORRENT_PEERS_ROWS__"
+
+        display=[]
+        rows=None
+
+        for line in raw.splitlines():
+            if line.startswith(marker):
+                try:
+                    rows=json.loads(
+                        line[len(marker):]
+                    )
+                except Exception:
+                    rows=None
+            else:
+                display.append(line)
+
+        if not isinstance(rows,list):
+            print(
+                "All-peer row map unavailable."
+            )
+            return
+
+        print(
+            "\n".join(display).rstrip()
+        )
+        print()
+
+        try:
+            choice=input(
+                "b=block, bl=blocked, "
+                "l=limits, p=peers, "
+                "r=refresh, q=back: "
+            ).strip()
+
+        except (EOFError,KeyboardInterrupt):
+            print()
+            return
+
+        if not choice:
+            continue
+
+        parts=choice.split()
+        command=parts[0].casefold()
+        values=parts[1:]
+
+        if command in {"q","quit","back"}:
+            return
+
+        if command in {"r","refresh"}:
+            continue
+
+        if command in {
+            "bl","blocked","blocks"
+        }:
+            if values:
+                print(
+                    "Use bl with no additional arguments."
+                )
+                continue
+
+            _peer_blocked_foreground()
+            continue
+
+        if command in {
+            "l","limit","limits"
+        }:
+            if values:
+                print(
+                    "Use l with no additional arguments."
+                )
+                continue
+
+            _peer_global_rates_foreground()
+            continue
+
+        if command in {"p","peers"}:
+            if values:
+                print(
+                    "Use p with no additional arguments."
+                )
+                continue
+
+            try:
+                target=input(
+                    "Peer view — job ID, "
+                    "or Enter for all: "
+                ).strip()
+
+            except (EOFError,KeyboardInterrupt):
+                print()
+                continue
+
+            if not target:
+                continue
+
+            try:
+                jid=int(target)
+            except ValueError:
+                print(
+                    "Peer view accepts one "
+                    "numeric job ID or Enter for all."
+                )
+                continue
+
+            if jid<1:
+                print(
+                    "Peer view requires a positive job ID."
+                )
+                continue
+
+            # Deliberately retain the existing p ID behavior.
+            if not PEERS.is_file() or not os.access(PEERS,os.X_OK):
+                raise SystemExit(
+                    f"torrent-peers is not executable: {PEERS}"
+                )
+            os.execv(
+                str(PEERS),
+                [
+                    str(PEERS),
+                    str(jid),
+                ],
+            )
+
+        if command in {"b","block"}:
+            if not values:
+                print(
+                    "Usage: b ROW [ROW ...]"
+                )
+                continue
+
+            try:
+                selected=_peer_parse_row_selection(
+                    values,
+                    len(rows),
+                )
+
+            except ValueError:
+                print(
+                    "Block accepts rows and ranges, "
+                    "e.g. b 1-7 12 18-22."
+                )
+                continue
+
+            except IndexError as exc:
+                print(
+                    "Live peer row(s) unavailable: "
+                    + str(exc)
+                )
+                continue
+
+            ips=[]
+
+            try:
+                for number in selected:
+                    row=rows[number-1]
+                    ip=str(row["ip"])
+                    ips.append(ip)
+
+            except Exception:
+                print(
+                    "Displayed peer row map is invalid."
+                )
+                continue
+
+            ips=list(
+                dict.fromkeys(ips)
+            )
+
+            try:
+                result=_peer_backend(
+                    [
+                        "__mgmt-block-many",
+                        *ips,
+                    ]
+                )
+
+            except Exception as exc:
+                print(exc)
+                continue
+
+            blocked={
+                line.split("\t",1)[1]
+                for line in result.splitlines()
+                if line.startswith("BLOCKED\t")
+            }
+            already={
+                line.split("\t",1)[1]
+                for line in result.splitlines()
+                if line.startswith("ALREADY_BLOCKED\t")
+            }
+            failed={
+                parts[1]:parts[2]
+                for line in result.splitlines()
+                if line.startswith("FAILED\t")
+                for parts in [line.split("\t",2)]
+            }
+
+            for line in result.splitlines():
+                if line.startswith("RETRY\t"):
+                    parts=line.split("\t",3)
+                    print(
+                        "Backend unavailable — retrying "
+                        f"{parts[2]} selected peer(s)..."
+                    )
+
+            successful=blocked|already
+            disconnect_outcomes={}
+
+            try:
+                state=load_state()
+                jobs={int(job["id"]):job for job in state.get("jobs",[])}
+            except Exception:
+                jobs={}
+
+            for jid in dict.fromkeys(
+                int(rows[number-1]["job"])
+                for number in selected
+                if str(rows[number-1].get("ip","")) in successful
+            ):
+                job_ips=list(dict.fromkeys(
+                    str(rows[number-1]["ip"])
+                    for number in selected
+                    if int(rows[number-1]["job"])==jid
+                    and str(rows[number-1].get("ip","")) in successful
+                ))
+                job=jobs.get(jid)
+                raw=(
+                    socket_query(
+                        job,
+                        "DROPPEERS " + ",".join(job_ips),
+                        timeout=0.75,
+                    )
+                    if job is not None
+                    else None
+                )
+                disconnect_outcomes[jid]=(
+                    raw is not None
+                    and raw.strip()=="OK\tQUEUED\tPEERS"
+                )
+
+            for number in selected:
+                row=rows[number-1]
+                ip=str(row.get("ip","?"))
+
+                if ip in blocked or ip in already:
+                    jid=int(row.get("job",0))
+                    print(
+                        f"Row {number}: blocked globally {ip} "
+                        f"[Job {row.get('job','?')}] + live disconnect "
+                        + (
+                            "confirmed"
+                            if disconnect_outcomes.get(jid,False)
+                            else "not confirmed"
+                        )
+                    )
+
+            if failed:
+                print(f"Blocked:         {len(blocked)}")
+                print(f"Already blocked: {len(already)}")
+                print(f"Failed:          {len(failed)}")
+                for ip,reason in failed.items():
+                    print(f"  {ip} — {reason}")
+
+            # The displayed rows are stale after enforcement.
+            continue
+
+        print(
+            "Use b=block, bl=blocked, "
+            "l=limits, p=peers, "
+            "r=refresh, q=back."
+        )
+
+
+def main():
+ # Maintenance dispatch precedes every normal startup mutation.  This is what
+ # makes audit, the Clean review screen, and dump genuinely read-only.
+ if len(sys.argv)>=2 and sys.argv[1].casefold()=="maint":
+  maint_module(sys.argv[2:])
+  return
+
+ # Hidden control-plane entry point used by torrent-peers after
+ # permanent BLOCK/UNBLOCK policy mutations.
+ #
+ # Foreground `f sync` remains available and unchanged.
+ # Retire fast-resume files with no queue owner.
+ # Ownership, never age, determines expiration.
+ RESUME_DIR.mkdir(mode=0o700,parents=True,exist_ok=True)
+
+ # Reconcile stale active ownership before any operator action.
+ # Reconciliation is conservative: it never starts a worker.
+ with locked_state() as startup_state:
+  for startup_job in startup_state.get('jobs',[]):
+   refresh(startup_job)
+
+ try:
+  resume_state=json.loads(STATE_FILE.read_text())
+  resume_owned={
+   int(x["id"])
+   for x in resume_state.get("jobs",[])
+   if "id" in x
+  }
+ except Exception:
+  resume_owned=set()
+
+ for resume_path in list(RESUME_DIR.glob("job-*.fastresume"))+list(RESUME_DIR.glob("job-*.fastresume.prev")):
+  resume_match=re.fullmatch(
+   r"job-([0-9]+)\.fastresume(?:\.prev)?",
+   resume_path.name
+  )
+
+  if not resume_match:
+   continue
+
+  if int(resume_match.group(1)) in resume_owned:
+   continue
+
+  try:
+   resume_path.unlink()
+  except FileNotFoundError:
+   pass
+  except OSError:
+   pass
+
+ # -------------------------------------------------------
+ # GLOBAL NETWORK CIRCUIT BREAKER
+ #
+ # Deliberate external controls:
+ #
+ #   torrent-mgmnt pause
+ #   torrent-mgmnt resume
+ #
+ # This logic is intentionally DIRECT. There is no
+ # pause/resume wrapper layer.
+ # -------------------------------------------------------
+
+ if len(sys.argv)==2 and sys.argv[1].casefold()=="pause":
+
+  existing=network_pause_read()
+
+  if existing["paused"]:
+   print("Global torrent network: PAUSED")
+   return
+
+  targets=[]
+
+  with locked_state() as state:
+   for job in state["jobs"]:
+    refresh(job)
+
+    if alive(job):
+     targets.append(int(job["id"]))
+
+  # CLOSE CIRCUIT FIRST.
+  #
+  # No new worker may enter after this write.
+  network_pause_write(True,targets)
+
+  try:
+   if targets:
+    pause_many(targets)
+
+  except BaseException:
+   # Remain fail-closed.
+   network_pause_write(True,targets)
+   raise
+
+  print(
+   f"Global torrent network: PAUSED | "
+   f"Workers stopped: {len(targets)}"
+  )
+
+  return
+
+
+ if len(sys.argv)==2 and sys.argv[1].casefold()=="resume":
+
+  current=network_pause_read()
+
+  if not current["paused"]:
+   print("Global torrent network: ACTIVE")
+   return
+
+  targets=list(
+   dict.fromkeys(
+    int(x)
+    for x in current["jobs"]
+   )
+  )
+
+  # OPEN CIRCUIT immediately before deliberate restoration.
+  network_pause_write(False,targets)
+
+  try:
+   if targets:
+    resume_many(targets)
+
+  except BaseException:
+   # A failed global resume must fail closed.
+   network_pause_write(True,targets)
+   raise
+
+  network_pause_write(False,[])
+
+  print(
+   f"Global torrent network: ACTIVE | "
+   f"Workers resumed: {len(targets)}"
+  )
+
+  return
+
+
+
+ if (
+  len(sys.argv) >= 2
+  and sys.argv[1].casefold() in {"f","filter"}
+ ):
+  filter_control_direct(
+   sys.argv[2:]
+  )
+  return
+
+ if len(sys.argv) == 1:
+  # Foreground Management is a persistent operator environment.
+  #
+  # Individual actions may use SystemExit internally to report
+  # invalid IDs or other rejected operations. Those failures must
+  # never terminate the foreground management session.
+  while True:
+   try:
+    management_module()
+    return
+
+   except SystemExit as exc:
+    code=exc.code
+
+    if isinstance(code,str):
+     message=code.strip()
+
+     if message:
+      print(message)
+
+    elif code not in (None,0):
+     print(
+      "Action rejected."
+     )
+
+    print()
+    continue
+
+ if (
+  len(sys.argv) >= 2
+  and sys.argv[1] == "prune"
+  and os.environ.get(
+   "TORRENT_MGMNT_INTERNAL_PRUNE"
+  ) != "1"
+ ):
+  raise SystemExit(
+   "Prune is controlled from the Torrent Management Module. "
+   "Run 'torrent-mgmnt' and select pr."
+  )
+
+ if (
+  len(sys.argv) >= 2
+  and sys.argv[1] == "contents"
+  and os.environ.get(
+   "TORRENT_MGMNT_INTERNAL_CONTENTS"
+  ) != "1"
+ ):
+  raise SystemExit(
+   "Contents is controlled from the Torrent Management Module. "
+   "Run 'torrent-mgmnt' and select c."
+  )
+
+ p=argparse.ArgumentParser(prog='torrent-queue'); sp=p.add_subparsers(dest='cmd',required=True)
+ a=sp.add_parser('submit'); a.add_argument('source'); a.add_argument('--save-path',default=str(DEST_DEFAULT)); a.add_argument('--origin',default=None); sp.add_parser('list')
+ a=sp.add_parser('expand'); a.add_argument('id',type=int,nargs='+')
+ a=sp.add_parser('contents'); a.add_argument('id',type=int,nargs='+')
+ a=sp.add_parser('resume'); a.add_argument('id',type=int,nargs='*')
+ a=sp.add_parser('pause'); a.add_argument('id',type=int,nargs='*')
+ sp.add_parser('resume-dispatch')
+ a=sp.add_parser('prune'); a.add_argument('id',type=int,nargs='?')
+ a=p.parse_args()
+ {'submit':lambda:submit(a.source,Path(a.save_path),a.origin),
+  'list':listq,
+  'expand':lambda:expand_many(a.id),
+  'contents':lambda:contents_many(a.id),
+  'resume':lambda:resume_many(a.id),
+  'pause':lambda:pause_many(a.id),
+  'resume-dispatch':resume_dispatch,
+  'prune':lambda:prune(a.id)}[a.cmd]()
+
+if __name__=='__main__':main()

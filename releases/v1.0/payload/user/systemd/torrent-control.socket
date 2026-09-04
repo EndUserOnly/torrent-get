@@ -1,0 +1,10 @@
+[Unit]
+Description=torrent-get control socket
+
+[Socket]
+ListenStream=%t/torrent-control.sock
+SocketMode=0600
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

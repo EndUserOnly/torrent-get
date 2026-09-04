@@ -1,0 +1,171 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import hashlib
+import os
+import sys
+
+from pathlib import Path
+from urllib.parse import parse_qs,urlsplit
+
+
+SEC=Path(__file__).resolve().parent
+
+sys.path.insert(
+    0,
+    str(SEC),
+)
+
+from approval_store import ApprovalStore
+
+from gatekeeper_diagnostic_connector import (
+    GateApprovalPackage,
+    GateStoreDecision,
+    authorize_gate_result,
+)
+
+
+STATE=SEC.parent/"metadata-approvals"
+
+
+def deny(reason):
+    print(
+        f"DENIED_STORE\t{reason}",
+        file=sys.stderr,
+    )
+
+    return 20
+
+
+def main():
+
+    if len(sys.argv)!=4:
+        return deny(
+            "invalid approval bridge invocation"
+        )
+
+    info_file=Path(
+        sys.argv[1]
+    )
+
+    manifest_file=Path(
+        sys.argv[2]
+    )
+
+    magnet_file=Path(
+        sys.argv[3]
+    )
+
+    try:
+        info=info_file.read_bytes()
+
+        if not info:
+            return deny(
+                "empty info section"
+            )
+
+        magnet=magnet_file.read_text(
+            encoding="utf-8"
+        ).strip()
+
+        query=parse_qs(
+            urlsplit(
+                magnet
+            ).query
+        )
+
+        xt=sorted({
+            value.strip().lower()
+            for value
+            in query.get("xt",[])
+            if value.strip()
+        })
+
+        if not xt:
+            return deny(
+                "torrent identity unavailable"
+            )
+
+        manifest=[]
+
+        for line in manifest_file.read_text(
+            encoding="ascii"
+        ).splitlines():
+
+            if not line:
+                continue
+
+            fields=line.split(
+                "\t"
+            )
+
+            if (
+                len(fields)!=3
+                or fields[0]!="FILE"
+            ):
+                return deny(
+                    "malformed manifest transport"
+                )
+
+            size=int(
+                fields[1]
+            )
+
+            path=bytes.fromhex(
+                fields[2]
+            ).decode(
+                "utf-8",
+                errors="strict",
+            )
+
+            manifest.append({
+                "path":path,
+                "size":size,
+            })
+
+        package=GateApprovalPackage(
+            accepted=True,
+            infohash="|".join(xt),
+            metadata_fingerprint=(
+                hashlib.sha256(
+                    info
+                ).hexdigest()
+            ),
+            manifest=tuple(
+                manifest
+            ),
+            validator_version=1,
+        )
+
+        result=authorize_gate_result(
+            package,
+            ApprovalStore(
+                STATE
+            ),
+        )
+
+        print(
+            result.decision.value
+            + "\t"
+            + result.reason
+        )
+
+        if result.decision in {
+            GateStoreDecision.APPROVED_NEW,
+            GateStoreDecision.APPROVED_EXISTING,
+        }:
+            return 0
+
+        return 21
+
+    except Exception as exc:
+        return deny(
+            f"{type(exc).__name__}: {exc}"
+        )
+
+
+if __name__=="__main__":
+    raise SystemExit(
+        main()
+    )

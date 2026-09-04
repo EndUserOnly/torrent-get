@@ -1,0 +1,296 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+import sys
+import argparse, fcntl, json, os, signal, socket, subprocess, time
+from collections import defaultdict
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+
+HOME=Path.home()
+STATE_DIR=HOME/'.local/share/torrent-queue'
+STATE_FILE=STATE_DIR/'jobs.json'
+LOCK_FILE=STATE_DIR/'jobs.lock'
+LOG_DIR=STATE_DIR/'logs'
+WORKER=HOME/'.local/libexec/torrent-worker-posix'
+DEST_DEFAULT=HOME/'Downloads/Torrents'
+MEMORY_HIGH='512M'
+MEMORY_MAX='1G'
+TASKS_MAX=128
+NOFILE=4096
+
+def ensure_dirs():
+ STATE_DIR.mkdir(parents=True,exist_ok=True); LOG_DIR.mkdir(parents=True,exist_ok=True)
+
+class locked_state:
+ def __enter__(self):
+  ensure_dirs(); self.fp=open(LOCK_FILE,'a+'); fcntl.flock(self.fp.fileno(),fcntl.LOCK_EX)
+  try:self.data=json.loads(STATE_FILE.read_text()) if STATE_FILE.exists() else {'next_id':1,'jobs':[]}
+  except:self.data={'next_id':1,'jobs':[]}
+  return self.data
+ def __exit__(self,t,v,tb):
+  if t is None:
+   tmp=STATE_FILE.with_suffix('.tmp'); tmp.write_text(json.dumps(self.data,indent=2,sort_keys=True)); os.replace(tmp,STATE_FILE); os.chmod(STATE_FILE,0o600)
+  fcntl.flock(self.fp.fileno(),fcntl.LOCK_UN); self.fp.close()
+
+def magnet_fields(m):
+ q=parse_qs(urlparse(m).query); dn=(q.get('dn') or ['Unnamed torrent'])[0]; xt=(q.get('xt') or [''])[0]
+ return dn,xt.rsplit(':',1)[-1].upper() if xt else ''
+
+def proc_start(pid):
+ try:return int(Path(f'/proc/{pid}/stat').read_text().split()[21])
+ except:return None
+
+def proc_argv(pid):
+ try:return [x.decode(errors='replace') for x in Path(f'/proc/{pid}/cmdline').read_bytes().split(b'\0') if x]
+ except:return []
+
+def cmdline(pid):
+ return ' '.join(proc_argv(pid))
+
+def alive(j):
+ pid=int(j.get('pid') or 0); ticks=proc_start(pid)
+ if pid<=0 or ticks is None or ticks!=j.get('proc_start_ticks'):return False
+ c=cmdline(pid); ih=j.get('infohash','')
+ return 'torrent-worker-posix' in c and (not ih or ih.lower() in c.lower())
+
+def safe_target(j):
+ p=Path(j['expected_payload']).expanduser(); dest=Path(j['save_path']).expanduser().resolve()
+ try:par=p.parent.resolve()
+ except:return None
+ return p if par==dest or dest in par.parents else None
+
+def refresh(j):
+ a=alive(j); p=safe_target(j); ex=bool(p and p.exists())
+ if a and not j.get('magnet'):
+  argv=proc_argv(int(j.get('pid') or 0))
+  if len(argv)>=2 and argv[1].startswith('magnet:?'):j['magnet']=argv[1]
+ if ex:j['payload_seen']=True
+ if a:j['state']='MISSING' if j.get('payload_seen') and not ex else ('STOPPING' if j.get('state')=='STOPPING' else 'RUNNING')
+ else:j['state']='STOPPED' if j.get('state')=='STOPPING' else ('EXITED' if j.get('state') in {'RUNNING','MISSING'} else j.get('state','EXITED'))
+ j['last_checked']=int(time.time())
+
+def get_job(s,jid):return next((j for j in s['jobs'] if int(j['id'])==jid),None)
+
+def human_size(n):
+ if n is None:return '--'
+ v=float(max(0,n)); u=['B','KiB','MiB','GiB','TiB']; i=0
+ while v>=1024 and i<len(u)-1:v/=1024;i+=1
+ return f'{v:.0f} {u[i]}' if i==0 else f'{v:.1f} {u[i]}'
+
+def activity(st,j):
+ if not alive(j):return '--'
+ if not st:return 'STARTING'
+ if not st['metadata']:return 'METADATA'
+ p=st['progress']; down=st['down']; up=st['up']
+ if p>=0.9995:return 'SEEDING' if up>0 else 'COMPLETE'
+ if down>0 and up>0:return 'TRANSFER'
+ if down>0:return 'DOWNLOADING'
+ if up>0:return 'UPLOADING'
+ return 'IDLE'
+
+def socket_query(j,command,timeout=3.0):
+ newp=Path(f"/run/user/{os.getuid()}/torrent-get/torrent-worker-job-{int(j['id'])}.sock")
+ pid=j.get('pid')
+ oldp=Path(f"/run/user/{os.getuid()}/torrent-get/torrent-worker-{int(pid)}.sock") if pid is not None else None
+ p=newp if newp.exists() else oldp
+ if p is None or not p.exists():return None
+ try:
+  with socket.socket(socket.AF_UNIX,socket.SOCK_STREAM) as s:
+   s.settimeout(timeout); s.connect(str(p)); s.sendall((command+'\n').encode()); raw=b''
+   while True:
+    b=s.recv(65536)
+    if not b:break
+    raw+=b
+   return raw.decode(errors='replace')
+ except:return None
+
+def live_status(j):
+ raw=socket_query(j,'STATUS')
+ if not raw:return None
+ x=raw.strip().split('\t')
+ try:
+  if len(x)>=9 and x[0]=='STATUS':
+   return {'metadata':x[1]=='1','progress':float(x[2]),'size':int(x[3]),'down':int(x[4]),'up':int(x[5]),'peers':int(x[6]),'seeds':int(x[7]),'name':x[8]}
+ except:pass
+ return None
+
+def systemd_main_pid(unit):
+ try:
+  out=subprocess.check_output(['systemctl','--user','show',unit,'-p','MainPID','--value'],text=True,stderr=subprocess.DEVNULL).strip(); pid=int(out or 0)
+  return pid if pid>0 else None
+ except:return None
+
+def launch_worker(j, magnet, save, logp, unit):
+ cmd=[
+  'systemd-run','--user','--quiet','--collect','--service-type=exec',f'--unit={unit}',
+  '--property=NoNewPrivileges=yes','--property=PrivateTmp=yes','--property=ProtectSystem=strict','--property=ProtectHome=read-only',
+  '--property=ProtectControlGroups=yes','--property=ProtectKernelModules=yes','--property=ProtectKernelTunables=yes','--property=RestrictSUIDSGID=yes','--property=LockPersonality=yes',
+  f'--property=MemoryHigh={MEMORY_HIGH}',f'--property=MemoryMax={MEMORY_MAX}',f'--property=TasksMax={TASKS_MAX}',f'--property=LimitNOFILE={NOFILE}',
+  f'--property=ReadWritePaths={save}',f'--property=ReadWritePaths=/run/user/{os.getuid()}',
+  f'--property=StandardOutput=append:{logp}',f'--property=StandardError=append:{logp}',str(WORKER),magnet,str(save)
+ ]
+ r=subprocess.run(cmd,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,text=True)
+ if r.returncode!=0:raise SystemExit(f'Unable to launch sandboxed worker: {r.stderr.strip() or "systemd-run failed"}')
+ pid=None
+ for _ in range(100):
+  pid=systemd_main_pid(unit)
+  if pid:break
+  time.sleep(.02)
+ if not pid:
+  subprocess.run(['systemctl','--user','stop',unit],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+  raise SystemExit('Sandboxed worker launched but MainPID could not be resolved.')
+ j['pid']=pid; j['proc_start_ticks']=proc_start(pid); j['state']='RUNNING'; j['submitted_at']=int(time.time()); j['systemd_unit']=unit; j['sandbox']='systemd-stage1'
+ j['limits']={'memory_high':MEMORY_HIGH,'memory_max':MEMORY_MAX,'tasks_max':TASKS_MAX,'nofile':NOFILE}
+ return pid
+
+def submit(magnet,save):
+ if not magnet.startswith('magnet:?'):raise SystemExit('Rejected: not a magnet URI.')
+ if not WORKER.exists():raise SystemExit(f'Queue worker missing: {WORKER}')
+ save=save.expanduser().resolve(); save.mkdir(parents=True,exist_ok=True); name,ih=magnet_fields(magnet)
+ with locked_state() as s:
+  jid=int(s.get('next_id',1)); s['next_id']=jid+1; logp=LOG_DIR/f'job-{jid}.log'; unit=f'torrent-worker-{jid}.service'; expected=save/name
+  j={'id':jid,'name':name,'infohash':ih,'magnet':magnet,'save_path':str(save),'expected_payload':str(expected),'payload_seen':expected.exists(),'log_path':str(logp),'restart_count':0}
+  launch_worker(j,magnet,save,logp,unit); s['jobs'].append(j)
+ print(f'Request submitted to queue. Job [{jid}].')
+
+def resume(jid):
+ if not WORKER.exists():raise SystemExit(f'Queue worker missing: {WORKER}')
+ with locked_state() as s:
+  j=get_job(s,jid)
+  if not j:raise SystemExit(f'Unknown queue job: {jid}')
+  refresh(j)
+  if j['state'] in {'RUNNING','MISSING','STOPPING'}:raise SystemExit(f"Job [{jid}] is already active (state: {j['state']}).")
+  magnet=j.get('magnet')
+  if not magnet:
+   raise SystemExit(f'Job [{jid}] predates persisted magnet support and cannot be resumed natively.')
+  save=Path(j['save_path']).expanduser().resolve(); save.mkdir(parents=True,exist_ok=True); logp=Path(j['log_path']); unit=f'torrent-worker-{jid}.service'
+  subprocess.run(['systemctl','--user','reset-failed',unit],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+  j['restart_count']=int(j.get('restart_count',0))+1; j['resumed_at']=int(time.time())
+  launch_worker(j,magnet,save,logp,unit)
+ print(f'Job [{jid}] resumed. Existing payload will be verified by libtorrent.')
+
+def state_refreshed():
+ with locked_state() as s:
+  for j in s['jobs']:refresh(j)
+  return json.loads(json.dumps(s))
+
+def listq():
+ s=state_refreshed(); print(); print(f"{'ID':>3}  {'State':<8}  {'Activity':<11}  {'Progress':>8}  {'Size':>10}  {'PID':>7}  {'Elapsed':>9}  Name"); print('-'*126); now=int(time.time())
+ if not s['jobs']:print('Queue is empty.')
+ for j in s['jobs']:
+  e=max(0,now-int(j['submitted_at'])); h,r=divmod(e,3600); m,sec=divmod(r,60); n=j['name'] if len(j['name'])<=51 else j['name'][:48]+'...'; st=live_status(j)
+  size=human_size(st['size']) if st and st['size'] else '--'; prog=f"{st['progress']*100:.1f}%" if st and st['metadata'] else '--'; act=activity(st,j)
+  pid_display = j.get('pid') if j.get('pid') is not None else '-'
+  print(f"{j['id']:>3}  {j['state']:<8}  {act:<11}  {prog:>8}  {size:>10}  {str(pid_display):>7}  {h:02d}:{m:02d}:{sec:02d}  {n}")
+ print()
+
+def expand(jid):
+ s=state_refreshed(); j=get_job(s,jid)
+ if not j:raise SystemExit(f'Unknown queue job: {jid}')
+ try:v=subprocess.check_output(['pkg-config','--modversion','libtorrent-rasterbar'],text=True,stderr=subprocess.DEVNULL).strip(); v='2.0.10.0' if v=='2.0.10' else v
+ except:v='unknown'
+ print(f"\nJob [{j['id']}] — {j['name']}\nState:       {j['state']}\n\nLaunching certified POSIX baseline...\nDestination: {j['save_path']}\n\nlibtorrent: {v}\nPID:        {j['pid']}\nSave path:  {j['save_path']}\nEngine:     native C++, one libtorrent session\nDisk I/O:   POSIX backend (no mmap)\nInfohash:   {j['infohash'] or '?'}\nLog:        {j['log_path']}")
+ if j.get('systemd_unit'):
+  print('Sandbox:    systemd user transient unit'); print(f"Unit:       {j['systemd_unit']}"); lim=j.get('limits') or {}; print(f"Limits:     MemoryHigh={lim.get('memory_high','?')} MemoryMax={lim.get('memory_max','?')} TasksMax={lim.get('tasks_max','?')} NOFILE={lim.get('nofile','?')}")
+ st=live_status(j)
+ if st:
+  print(f"Metadata:   {'READY' if st['metadata'] else 'WAITING'}"); print(f"Size:       {human_size(st['size'])}"); print(f"Progress:   {st['progress']*100:.1f}%"); print(f"Peers:      {st['peers']} connected / {st['seeds']} seeds")
+ else:print('Metadata:   live interface unavailable'); print('Size:       --')
+ p=Path(j['expected_payload']); print(f"Payload:    {p} ({'present' if p.exists() else ('MISSING' if j.get('payload_seen') else 'not yet confirmed')})\n")
+
+def bar(done,size,width=18):
+ pct=1.0 if size==0 else max(0.0,min(1.0,done/size)); filled=int(round(pct*width)); return '['+'█'*filled+'-'*(width-filled)+']',pct*100
+
+def contents(jid):
+ s=state_refreshed(); j=get_job(s,jid)
+ if not j:raise SystemExit(f'Unknown queue job: {jid}')
+ if not alive(j):raise SystemExit(f"Job [{jid}] is not active. Resume it before requesting live contents progress.")
+ st=live_status(j)
+ if not st or not st['metadata']:raise SystemExit('Metadata is not READY yet.')
+ raw=socket_query(j,'FILES',timeout=10.0)
+ if not raw:raise SystemExit('Live contents interface unavailable.')
+ if raw.startswith('ERROR\t'):raise SystemExit(raw.strip().split('\t',1)[1])
+ files=[]
+ for line in raw.splitlines():
+  x=line.split('\t',3)
+  if len(x)==4 and x[0]=='FILE':
+   try:files.append((x[3],int(x[1]),int(x[2])))
+   except:pass
+ folders=defaultdict(lambda:[0,0])
+ for path,size,done in files:
+  parts=Path(path).parts
+  for i in range(1,len(parts)):
+   folder=str(Path(*parts[:i]))+'/' ; folders[folder][0]+=size; folders[folder][1]+=done
+ rows=[]
+ for folder,(size,done) in folders.items():rows.append((folder,size,done,'DIR'))
+ for path,size,done in files:rows.append((path,size,done,'FILE'))
+ rows.sort(key=lambda r:(r[0].lower(),0 if r[3]=='DIR' else 1))
+ print(f"\nJob [{j['id']}] — {j['name']}")
+ print(f"Progress: {st['progress']*100:.1f}% of {human_size(st['size'])}")
+ print('\n Contents (verified piece progress)')
+ print('-'*112); print(f"{'Progress':<27} {'Done / Size':>24}  Type  Path"); print('-'*112)
+ for path,size,done,kind in rows:
+  b,pct=bar(done,size); amount=f"{human_size(done)} / {human_size(size)}"
+  print(f"{b} {pct:6.1f}% {amount:>24}  {kind:<4}  {path}")
+ print()
+
+def stop(jid):
+ with locked_state() as s:
+  j=get_job(s,jid)
+  if not j:raise SystemExit(f'Unknown queue job: {jid}')
+  refresh(j)
+  if j['state'] not in {'RUNNING','MISSING'}:print(f"Job [{jid}] is not running (state: {j['state']})."); return
+  print(f"Stop job [{jid}] {j['name']}\n\nPayload:\n  [k] Keep downloaded/partial files\n  [r] Remove downloaded/partial files\n  [c] Cancel"); c=input('Choice [k]: ').strip().lower() or 'k'
+  if c=='c':print('Cancelled.'); return
+  if c not in {'k','r'}:print('Invalid choice; cancelled.'); return
+  unit=j.get('systemd_unit')
+  if unit:
+   r=subprocess.run(['systemctl','--user','stop',unit],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+   if r.returncode!=0 and not alive(j):j['state']='EXITED'; print('Worker already exited.'); return
+   j['state']='STOPPING'
+  else:
+   try:os.killpg(int(j['pid']),signal.SIGTERM); j['state']='STOPPING'
+   except ProcessLookupError:j['state']='EXITED'; print('Worker already exited.'); return
+  for _ in range(30):
+   if not alive(j):break
+   time.sleep(.1)
+  refresh(j)
+  if c=='r':
+   t=safe_target(j)
+   if t is None:print('Removal refused: payload path failed safety validation.')
+   elif t.exists():
+    import shutil; root=Path(j['save_path']).expanduser().resolve()
+    try:resolved=t.resolve(strict=True)
+    except Exception:resolved=None
+    if t.is_symlink():print('Removal refused: payload target is a symbolic link.')
+    elif resolved is None:print('Removal refused: payload path could not be resolved safely.')
+    elif resolved.parent!=root:print('Removal refused: payload is not an exact top-level item in the save directory.')
+    elif t.name!=Path(j['expected_payload']).name:print('Removal refused: payload name does not match the queued job.')
+    elif t.is_dir():shutil.rmtree(t); print(f'Removed payload directory: {t}')
+    elif t.is_file():t.unlink(); print(f'Removed payload file: {t}')
+    else:print('Removal refused: unsupported payload type.')
+   else:print('Payload is already absent.')
+  print(f"Job [{jid}] state: {j['state']}")
+
+def prune(jid=None):
+ with locked_state() as s:
+  for j in s['jobs']:refresh(j)
+  inactive={'EXITED','STOPPED'}
+  if jid is None:
+   before=len(s['jobs']); s['jobs']=[j for j in s['jobs'] if j.get('state') not in inactive]; print(f"Pruned {before-len(s['jobs'])} inactive queue record(s)."); return
+  j=get_job(s,jid)
+  if not j:raise SystemExit(f'Unknown queue job: {jid}')
+  if j.get('state') not in inactive:raise SystemExit(f"Job [{jid}] is {j.get('state')}; only EXITED/STOPPED records can be pruned.")
+  s['jobs']=[x for x in s['jobs'] if int(x['id'])!=jid]; print(f'Pruned queue record [{jid}]. Payload and logs were not touched.')
+
+def main():
+ p=argparse.ArgumentParser(prog='torrent-queue'); sp=p.add_subparsers(dest='cmd',required=True)
+ a=sp.add_parser('submit'); a.add_argument('magnet'); a.add_argument('--save-path',default=str(DEST_DEFAULT)); sp.add_parser('list')
+ a=sp.add_parser('expand'); a.add_argument('id',type=int); a=sp.add_parser('contents'); a.add_argument('id',type=int); a=sp.add_parser('resume'); a.add_argument('id',type=int)
+ a=sp.add_parser('stop'); a.add_argument('id',type=int); a=sp.add_parser('prune'); a.add_argument('id',type=int,nargs='?')
+ if len(sys.argv)==1:
+     sys.argv.append("list")
+
+ a=p.parse_args(); {'submit':lambda:submit(a.magnet,Path(a.save_path)),'list':listq,'expand':lambda:expand(a.id),'contents':lambda:contents(a.id),'resume':lambda:resume(a.id),'stop':lambda:stop(a.id),'prune':lambda:prune(a.id)}[a.cmd]()
+
+if __name__=='__main__':main()

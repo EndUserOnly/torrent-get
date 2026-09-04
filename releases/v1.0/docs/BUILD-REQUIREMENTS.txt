@@ -1,0 +1,12 @@
+Build platform: GNU/Linux x86_64
+Compiler: g++ with C++17 support
+Build metadata: pkg-config
+Native dependency: libtorrent-rasterbar development files
+Runtime: Python 3, libtorrent-rasterbar, OpenSSL, GNU C++ runtime
+Runtime services: systemd, nftables, sudo
+Python GeoIP reader: geoip2 or maxminddb
+Mandatory search service: Jackett v0.24.2527 (bundled official Linux x64 build)
+
+
+Reconstruct the native worker with ./build-worker.sh. On the frozen build host,
+the rebuilt worker must match payload/user/libexec/torrent-worker-posix exactly.

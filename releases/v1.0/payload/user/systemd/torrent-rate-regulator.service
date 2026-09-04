@@ -1,0 +1,28 @@
+[Unit]
+Description=torrent-get aggregate transfer-rate regulator
+
+[Service]
+Type=simple
+Slice=torrent-get.slice
+ExecStart=%h/.local/bin/torrent-rate-regulator
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+# Lightweight regulator confinement.
+# Regulator requires local worker IPC only.
+PrivateDevices=yes
+RestrictAddressFamilies=AF_UNIX
+SystemCallArchitectures=native
+
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+
+RestrictSUIDSGID=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=default.target

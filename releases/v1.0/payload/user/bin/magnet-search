@@ -1,0 +1,447 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import concurrent.futures
+import json
+import re
+import sys
+import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass
+from pathlib import Path
+
+CONFIG_FILE = Path.home() / ".config" / "torrent-cli" / "config.json"
+TORZNAB_NS = "http://torznab.com/schemas/2015/feed"
+PER_INDEXER_TIMEOUT = 12
+PER_INDEXER_LIMIT = 100
+
+
+@dataclass
+class Result:
+    title: str
+    size: int
+    seeders: int
+    peers: int
+    source: str
+    uri: str
+    age: str = "..."
+
+
+def human_size(value: int) -> str:
+    if value <= 0:
+        return "?"
+    units = ["B", "KiB", "MiB", "GiB", "TiB"]
+    n = float(value)
+    for unit in units:
+        if n < 1024.0 or unit == units[-1]:
+            return f"{n:.1f} {unit}"
+        n /= 1024.0
+    return f"{n:.1f} TiB"
+
+
+def load_jackett() -> tuple[str, str]:
+    if not CONFIG_FILE.exists():
+        raise SystemExit(f"Config not found: {CONFIG_FILE}")
+
+    data = json.loads(CONFIG_FILE.read_text())
+    indexers = data.get("indexers") or []
+    if not indexers:
+        raise SystemExit("No Jackett/Torznab indexer found in existing config.")
+
+    # Reuse the existing Jackett aggregate entry only to discover host/API key.
+    chosen = None
+    for item in indexers:
+        url = str(item.get("url", ""))
+        if "127.0.0.1:9117" in url or "/api/v2.0/indexers/" in url:
+            chosen = item
+            break
+    if chosen is None:
+        chosen = indexers[0]
+
+    url = str(chosen.get("url", ""))
+    api_key = str(chosen.get("api_key", ""))
+    parsed = urllib.parse.urlparse(url)
+
+    if not parsed.scheme or not parsed.netloc:
+        raise SystemExit(f"Unable to derive Jackett host from: {url}")
+
+    base = f"{parsed.scheme}://{parsed.netloc}"
+    if not api_key:
+        raise SystemExit("Jackett API key is missing from existing config.")
+
+    return base, api_key
+
+
+def request_bytes(url: str, timeout: int) -> bytes:
+    req = urllib.request.Request(url, headers={"User-Agent": "magnet-search/0.1"})
+    with urllib.request.urlopen(req, timeout=timeout) as response:
+        return response.read()
+
+
+def discover_indexers(base: str, api_key: str) -> list[tuple[str, str]]:
+    params = urllib.parse.urlencode({
+        "apikey": api_key,
+        "t": "indexers",
+        "configured": "true",
+    })
+    url = f"{base}/api/v2.0/indexers/all/results/torznab/api?{params}"
+    data = request_bytes(url, timeout=10)
+    root = ET.fromstring(data)
+
+    found: list[tuple[str, str]] = []
+    seen: set[str] = set()
+
+    # Jackett's t=indexers output has used <indexer> records. Be permissive
+    # about whether ID/name are attributes or child elements.
+    for elem in root.iter():
+        tag = elem.tag.rsplit("}", 1)[-1].lower()
+        if tag != "indexer":
+            continue
+
+        idx = (
+            elem.attrib.get("id")
+            or elem.attrib.get("identifier")
+            or elem.attrib.get("indexer")
+            or ""
+        ).strip()
+        name = (
+            elem.attrib.get("name")
+            or elem.attrib.get("title")
+            or ""
+        ).strip()
+
+        if not idx:
+            for child in elem:
+                ctag = child.tag.rsplit("}", 1)[-1].lower()
+                value = (child.text or "").strip()
+                if ctag in {"id", "identifier", "indexer"} and value:
+                    idx = value
+                elif ctag in {"name", "title"} and value:
+                    name = value
+
+        if idx and idx not in {"all", "filter"} and idx not in seen:
+            seen.add(idx)
+            found.append((idx, name or idx))
+
+    if not found:
+        raise RuntimeError("Jackett returned no configured child indexers.")
+
+    return found
+
+
+def attr_map(item: ET.Element) -> dict[str, str]:
+    attrs: dict[str, str] = {}
+    for elem in item.findall(f"{{{TORZNAB_NS}}}attr"):
+        name = elem.attrib.get("name", "")
+        value = elem.attrib.get("value", "")
+        if name:
+            attrs[name] = value
+    return attrs
+
+
+def text(item: ET.Element, name: str) -> str:
+    elem = item.find(name)
+    if elem is not None and elem.text:
+        return elem.text.strip()
+    return ""
+
+
+def pick_uri(item: ET.Element, attrs: dict[str, str]) -> str:
+    for key in ("magneturl", "magnet"):
+        value = attrs.get(key, "")
+        if value:
+            return value
+
+    for tag in ("link", "guid"):
+        value = text(item, tag)
+        if value.startswith(("magnet:", "http://", "https://")):
+            return value
+
+    enclosure = item.find("enclosure")
+    if enclosure is not None:
+        value = enclosure.attrib.get("url", "")
+        if value:
+            return value
+    return ""
+
+
+def format_torrent_age(pubdate: str) -> str:
+    """Format a Torznab pubDate for operator display."""
+    value=str(pubdate or "").strip()
+
+    if not value:
+        return "..."
+
+    try:
+        from datetime import datetime, timezone
+        from email.utils import parsedate_to_datetime
+
+        published=parsedate_to_datetime(value)
+
+        if published.tzinfo is None:
+            published=published.replace(
+                tzinfo=timezone.utc
+            )
+
+        published=published.astimezone(
+            timezone.utc
+        )
+
+        today=datetime.now(
+            timezone.utc
+        ).date()
+
+        published_date=published.date()
+        days=(today-published_date).days
+
+        if days < 0:
+            age="future"
+        elif days == 0:
+            age="today"
+        elif days == 1:
+            age="1 day"
+        elif days < 60:
+            age=f"{days} days"
+        else:
+            months=(
+                (today.year-published_date.year)*12
+                + today.month-published_date.month
+            )
+
+            if today.day < published_date.day:
+                months-=1
+
+            months=max(1,months)
+
+            if months < 24:
+                age=f"{months}mo"
+            else:
+                years,remainder=divmod(
+                    months,
+                    12,
+                )
+
+                age=(
+                    f"{years}y {remainder}mo"
+                    if remainder
+                    else f"{years}y"
+                )
+
+        return (
+            f"{age} — "
+            f"{published_date.isoformat()}"
+        )
+
+    except Exception:
+        return value
+
+
+def search_one(base: str, api_key: str, indexer_id: str, indexer_name: str, query: str) -> tuple[str, list[Result]]:
+    params = urllib.parse.urlencode({
+        "apikey": api_key,
+        "t": "search",
+        "q": query,
+        "limit": str(PER_INDEXER_LIMIT),
+    })
+    url = f"{base}/api/v2.0/indexers/{urllib.parse.quote(indexer_id, safe='')}/results/torznab/api?{params}"
+    data = request_bytes(url, timeout=PER_INDEXER_TIMEOUT)
+    root = ET.fromstring(data)
+
+    results: list[Result] = []
+    for item in root.findall(".//item"):
+        attrs = attr_map(item)
+        uri = pick_uri(item, attrs)
+        if not uri:
+            continue
+
+        title = text(item, "title") or "(untitled)"
+        try:
+            size = int(attrs.get("size") or text(item, "size") or 0)
+        except Exception:
+            size = 0
+
+        def as_int(key: str) -> int:
+            try:
+                return int(attrs.get(key, "0") or 0)
+            except Exception:
+                return 0
+
+        source = text(item, "jackettindexer") or indexer_name
+        pubdate = text(item, "pubDate")
+
+        results.append(Result(
+            title=title,
+            size=size,
+            seeders=as_int("seeders"),
+            peers=as_int("peers"),
+            source=source,
+            uri=uri,
+            age=format_torrent_age(pubdate),
+        ))
+
+    return indexer_name, results
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def resolve_to_magnet(uri: str) -> str:
+    if uri.startswith("magnet:"):
+        return uri
+
+    req = urllib.request.Request(uri, headers={"User-Agent": "magnet-search/0.1"})
+    opener = urllib.request.build_opener(NoRedirect)
+
+    try:
+        response = opener.open(req, timeout=15)
+        final_url = response.geturl()
+        data = response.read()
+    except urllib.error.HTTPError as exc:
+        location = exc.headers.get("Location", "")
+        if exc.code in {301, 302, 303, 307, 308} and location.startswith("magnet:"):
+            return location
+        if exc.code in {301, 302, 303, 307, 308} and location.startswith(("http://", "https://")):
+            return resolve_to_magnet(location)
+        raise
+
+    if final_url.startswith("magnet:"):
+        return final_url
+
+    body = data[:8192].decode("utf-8", "ignore").strip()
+    if body.startswith("magnet:"):
+        return body
+
+    # Jackett/indexer supplied a .torrent. Convert it to a magnet locally.
+    try:
+        import libtorrent as lt
+    except ImportError:
+        raise RuntimeError(
+            "Selected result is a .torrent URL and python3-libtorrent is unavailable "
+            "for local .torrent -> magnet conversion."
+        )
+
+    with tempfile.NamedTemporaryFile(prefix="magnet-search-", suffix=".torrent", delete=False) as tmp:
+        tmp.write(data)
+        tmp_path = Path(tmp.name)
+
+    try:
+        ti = lt.torrent_info(str(tmp_path))
+        magnet = lt.make_magnet_uri(ti)
+        if not magnet.startswith("magnet:"):
+            raise RuntimeError("libtorrent did not produce a magnet URI.")
+        return magnet
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
+def main() -> int:
+    query = " ".join(sys.argv[1:]).strip()
+    if not query:
+        query = input("Search: ").strip()
+    if not query:
+        return 0
+
+    # Canonical search query: user capitalization must not change discovery.
+    query = query.casefold()
+
+    base, api_key = load_jackett()
+
+    print("Discovering configured Jackett indexers...")
+    try:
+        indexers = discover_indexers(base, api_key)
+    except Exception as exc:
+        print(f"Indexer discovery failed: {exc}", file=sys.stderr)
+        return 2
+
+    print(f"Searching {len(indexers)} indexer(s) in parallel; {PER_INDEXER_TIMEOUT}s ceiling each.")
+
+    collected: list[Result] = []
+    failures: list[str] = []
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(12, max(1, len(indexers)))) as pool:
+        future_map = {
+            pool.submit(search_one, base, api_key, idx, name, query): name
+            for idx, name in indexers
+        }
+
+        for future in concurrent.futures.as_completed(future_map):
+            name = future_map[future]
+            try:
+                _, results = future.result()
+                collected.extend(results)
+                print(f"  {name}: {len(results)} result(s)")
+            except Exception as exc:
+                failures.append(name)
+                print(f"  {name}: skipped ({type(exc).__name__})")
+
+    # Case-insensitive logical dedupe. A direct magnet infohash is authoritative;
+    # otherwise normalized title+size suppresses case-only duplicates.
+    unique: dict[tuple, Result] = {}
+    for result in collected:
+        btih = ""
+        if result.uri.startswith("magnet:"):
+            try:
+                q = urllib.parse.parse_qs(urllib.parse.urlparse(result.uri).query)
+                xt = (q.get("xt") or [""])[0]
+                if xt.lower().startswith("urn:btih:"):
+                    btih = xt.rsplit(":", 1)[-1].upper()
+            except Exception:
+                btih = ""
+        key = ("btih", btih) if btih else ("title-size", result.title.casefold().strip(), int(result.size or 0))
+        prev = unique.get(key)
+        if prev is None or result.seeders > prev.seeders:
+            unique[key] = result
+
+    results = sorted(
+        unique.values(),
+        key=lambda r: (r.seeders, r.peers, r.size),
+        reverse=True,
+    )
+
+    if not results:
+        print("No usable results.")
+        return 1
+
+    print()
+    print(f"{'#':>3}  {'Seeds':>6}  {'Size':>10}  {'Source':<20}  Name")
+    print("-" * 105)
+    for i, r in enumerate(results, 1):
+        title = r.title if len(r.title) <= 64 else r.title[:61] + "..."
+        print(f"{i:>3}  {r.seeders:>6}  {human_size(r.size):>10}  {r.source[:20]:<20}  {title}")
+
+    if failures:
+        print()
+        print(f"Partial results: {len(failures)} indexer(s) timed out or failed.")
+
+    while True:
+        print()
+        choice = input("Select result number, or q when finished: ").strip()
+        if choice.lower() in {"q", "quit", "exit"}:
+            return 0
+        try:
+            n = int(choice)
+        except ValueError:
+            continue
+        if not 1 <= n <= len(results):
+            continue
+
+        selected = results[n - 1]
+        try:
+            magnet = resolve_to_magnet(selected.uri)
+        except Exception as exc:
+            print(f"Unable to obtain magnet: {exc}", file=sys.stderr)
+            continue
+
+        print()
+        print(magnet)
+        print(f"Selected result {n}. Choose another result, or q when finished.")
+        continue
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,4 @@
+Excluded by design: runtime state, job data, resume data, metadata approvals,
+security logs, caches, download payloads, credentials, block-list state,
+machine-specific configuration, historical backups, and obsolete sources.
+

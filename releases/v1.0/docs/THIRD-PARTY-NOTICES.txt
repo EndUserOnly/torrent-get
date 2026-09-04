@@ -1,0 +1,7 @@
+Jackett v0.24.2527
+Project: https://github.com/Jackett/Jackett
+Bundled file: third-party/Jackett.Binaries.LinuxAMDx64-v0.24.2527.tar.gz
+SHA-256: 13748450c3762a9d095f6959eab50b0d209cc298d4103e81f3144a80db8bd709
+License: GNU General Public License v2.0; the upstream LICENSE file is included
+inside the bundled Jackett archive.
+
