@@ -1,0 +1,96 @@
+#!/usr/bin/env python3
+
+import json
+import os
+import re
+import socket
+import struct
+import threading
+from pathlib import Path
+
+
+RUNTIME = Path(f"/run/user/{os.getuid()}/torrent-get")
+ALLOWED = re.compile(
+    r"^(?:STATUS|PEERS|FILES|LIMITS|BLOCKS|"
+    r"SEQUENCE [0-9]+|LIMIT (?:DOWN|UP) [0-9]+|"
+    r"DROPPEERS [0-9A-Fa-f:.,]+)$"
+)
+
+
+def worker_query(job_id, pid, command, timeout):
+    current = RUNTIME / f"torrent-worker-job-{job_id}.sock"
+    legacy = RUNTIME / f"torrent-worker-{pid}.sock"
+    path = current if current.exists() else legacy
+
+    if not path.exists():
+        raise FileNotFoundError("worker socket unavailable")
+
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as peer:
+        peer.settimeout(timeout)
+        peer.connect(str(path))
+        peer.sendall((command + "\n").encode())
+        reply = bytearray()
+
+        while True:
+            block = peer.recv(65536)
+            if not block:
+                break
+            reply.extend(block)
+            if len(reply) > 8 * 1024 * 1024:
+                raise ValueError("worker reply too large")
+
+    return bytes(reply)
+
+
+def handle_request(client):
+    client.settimeout(12.0)
+    _, uid, _ = struct.unpack("3i", client.getsockopt(
+        socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")
+    ))
+    if uid != os.getuid():
+        return
+
+    request = bytearray()
+    while not request.endswith(b"\n"):
+        block = client.recv(4096)
+        if not block:
+            return
+        request.extend(block)
+        if len(request) > 4096:
+            raise ValueError("request too large")
+
+    data = json.loads(request)
+    job_id = int(data["job_id"])
+    pid = int(data.get("pid") or 0)
+    command = str(data["command"])
+    timeout = min(10.0, max(0.1, float(data.get("timeout", 3.0))))
+
+    if job_id < 1 or pid < 0 or not ALLOWED.fullmatch(command):
+        raise ValueError("invalid control request")
+
+    client.sendall(worker_query(job_id, pid, command, timeout))
+
+
+def handle(client):
+    try:
+        handle_request(client)
+    except Exception as exc:
+        try:
+            client.sendall(
+                f"ERROR\tCONTROL\t{type(exc).__name__}: {exc}\n".encode()
+            )
+        except OSError:
+            pass
+    finally:
+        client.close()
+
+
+def serve():
+    listener = socket.socket(fileno=3)
+    while True:
+        client, _ = listener.accept()
+        threading.Thread(target=handle, args=(client,), daemon=True).start()
+
+
+if __name__ == "__main__":
+    serve()

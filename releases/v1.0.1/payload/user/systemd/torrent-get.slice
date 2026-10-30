@@ -1,0 +1,7 @@
+[Unit]
+Description=torrent-get aggregate resource boundary
+
+[Slice]
+MemoryHigh=4G
+MemoryMax=6G
+TasksMax=768

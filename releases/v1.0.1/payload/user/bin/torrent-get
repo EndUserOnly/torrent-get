@@ -1,0 +1,2173 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+import urllib.parse
+import xml.etree.ElementTree as ET
+import re
+
+import concurrent.futures
+import importlib.machinery
+import importlib.util
+import readline  # shell-like history inside torrent-get
+import subprocess
+import sys
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+
+import json
+import os
+import socket
+import time
+HOME = Path.home()
+SEARCH = HOME / ".local/bin/magnet-search"
+
+QUEUE_STATE = HOME / ".local/share/torrent-queue/jobs.json"
+
+QUEUE = HOME / ".local/bin/torrent-mgmnt"
+
+
+def load_search_module():
+    loader = importlib.machinery.SourceFileLoader("torrent_get_magnet_search", str(SEARCH))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[loader.name] = mod
+    loader.exec_module(mod)
+    return mod
+
+
+
+VIDEO_EXTS = {
+    ".mkv", ".mp4", ".m4v", ".avi", ".webm", ".mov",
+    ".mpg", ".mpeg", ".ts", ".m2ts", ".wmv", ".flv",
+}
+
+AUDIO_EXTS = {
+    ".mp3", ".flac", ".m4a", ".aac", ".ogg", ".opus",
+    ".wav", ".wma", ".alac", ".ape",
+}
+
+PICTURE_EXTS = {
+    ".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp",
+    ".tif", ".tiff", ".heic", ".avif",
+}
+
+BOOK_EXTS = {
+    ".pdf", ".epub", ".mobi", ".azw", ".azw3", ".djvu",
+    ".cbz", ".cbr", ".fb2",
+}
+
+
+def infer_media(result):
+    """
+    Lightweight search-time classification.
+
+    This deliberately uses only data already returned by the
+    indexer. It does not resolve URLs, obtain torrent metadata,
+    contact trackers, query DHT, or inspect payloads.
+
+    Unknown/ambiguous remains "...".
+    """
+
+    title = str(
+        getattr(result, "title", "") or ""
+    ).strip()
+
+    text = title.casefold()
+
+    # Normalize common separators so tokens such as ".flac",
+    # "[FLAC]", " WEB-DL " and "_epub" are all searchable.
+    normalized = (
+        text
+        .replace("[", " ")
+        .replace("]", " ")
+        .replace("(", " ")
+        .replace(")", " ")
+        .replace("{", " ")
+        .replace("}", " ")
+        .replace("_", " ")
+        .replace("-", " ")
+        .replace(".", " ")
+        .replace("/", " ")
+    )
+
+    tokens = set(normalized.split())
+
+    # --------------------------------------------------------
+    # Strong book indicators
+    # --------------------------------------------------------
+
+    book_tokens = {
+        "epub", "mobi", "azw", "azw3", "djvu",
+        "cbz", "cbr", "fb2",
+    }
+
+    book_hint = bool(tokens & book_tokens)
+
+    # PDF is useful, but avoid treating random references to PDF
+    # inside a video title as definitive unless it looks file-like.
+    if "pdf" in tokens:
+        book_hint = True
+
+    # --------------------------------------------------------
+    # Strong picture indicators
+    # --------------------------------------------------------
+
+    picture_tokens = {
+        "imageset", "image", "images", "photoset",
+        "photo", "photos", "pictures",
+        "jpg", "jpeg", "png", "webp", "heic",
+    }
+
+    picture_hint = bool(tokens & picture_tokens)
+
+    # --------------------------------------------------------
+    # Strong audio indicators
+    # --------------------------------------------------------
+
+    audio_tokens = {
+        "flac", "mp3", "m4a", "alac", "ape",
+        "opus", "ogg",
+    }
+
+    audio_hint = bool(tokens & audio_tokens)
+
+    # Audio collection language is useful only when paired with
+    # an audio-oriented term. We intentionally do not classify
+    # every occurrence of "AAC" as Music because video releases
+    # commonly advertise AAC audio.
+    music_collection_hint = any(
+        phrase in text for phrase in (
+            "discography",
+            "soundtrack",
+            " ost ",
+            " album ",
+            " albums ",
+        )
+    )
+
+    if music_collection_hint and not any(
+        x in text for x in (
+            "1080p", "2160p", "720p",
+            "webrip", "web-dl", "bluray",
+            "bdrip", "hdtv",
+        )
+    ):
+        audio_hint = True
+
+    # --------------------------------------------------------
+    # Strong video indicators
+    # --------------------------------------------------------
+
+    video_tokens = {
+        "mkv", "mp4", "avi", "webm", "m4v",
+        "x264", "x265", "h264", "h265", "hevc",
+        "webrip", "bluray", "bdrip", "dvdrip",
+        "hdtv", "webdl",
+        "1080p", "2160p", "720p", "480p",
+    }
+
+    video_hint = bool(tokens & video_tokens)
+
+    # Common WEB-DL spelling was split into WEB + DL above.
+    if "web-dl" in text or "web dl" in text:
+        video_hint = True
+
+    # --------------------------------------------------------
+    # Decide primary category.
+    #
+    # Do not call ancillary cover art "Mixed".
+    # --------------------------------------------------------
+
+    primary = []
+
+    if book_hint:
+        primary.append("Books")
+
+    if audio_hint:
+        primary.append("Music")
+
+    if video_hint:
+        primary.append("Video")
+
+    # Pictures only become a competing primary type when no
+    # conventional media payload has already been identified.
+    if picture_hint and not primary:
+        primary.append("Pictures")
+
+    if len(primary) > 1:
+        return "Mixed"
+
+    if primary == ["Books"]:
+        return "Books"
+
+    if primary == ["Music"]:
+        return "Music"
+
+    if primary == ["Pictures"]:
+        return "Pictures"
+
+    if primary == ["Video"]:
+        # Infer a multi-video package only with strong collection/
+        # season evidence. Single episodes remain Movies because
+        # the taxonomy describes payload shape, not television genre.
+        multi_markers = (
+            "complete season",
+            "complete series",
+            "season pack",
+            "collection",
+            "box set",
+            "boxset",
+        )
+
+        if any(x in text for x in multi_markers):
+            return "Video/Multi"
+
+        # S01 without an episode marker is commonly a season pack.
+
+        season = re.search(r"\bs\d{1,2}\b", normalized)
+        episode = re.search(r"\bs\d{1,2}\s*e\d{1,3}\b", normalized)
+
+        if season and not episode:
+            return "Video/Multi"
+
+        return "Movies"
+
+    return "..."
+
+
+
+def result_infohash(uri: str):
+    uri = str(uri or "").strip()
+
+    if not uri.startswith("magnet:"):
+        return None
+
+    try:
+        q = parse_qs(urlparse(uri).query)
+        xt = (q.get("xt") or [""])[0]
+
+        if xt.lower().startswith("urn:btih:"):
+            return xt.rsplit(":", 1)[-1].upper()
+    except Exception:
+        pass
+
+    return None
+
+
+
+
+
+
+def local_worker_query(job, command, timeout=0.50):
+    try:
+        jid = int(job["id"])
+    except Exception:
+        return None
+
+    candidates = [
+        Path(
+            f"/run/user/{os.getuid()}/torrent-get/"
+            f"torrent-worker-job-{jid}.sock"
+        ),
+    ]
+
+    try:
+        pid = int(job.get("pid") or 0)
+    except Exception:
+        pid = 0
+
+    if pid > 0:
+        candidates.extend([
+            Path(
+                f"/run/user/{os.getuid()}/torrent-get/"
+                f"torrent-worker-{pid}.sock"
+            ),
+            Path(
+                f"/run/user/{os.getuid()}/"
+                f"torrent-worker-{pid}.sock"
+            ),
+        ])
+
+    path = next((x for x in candidates if x.exists()), None)
+
+    if path is None:
+        return None
+
+    try:
+        with socket.socket(
+            socket.AF_UNIX,
+            socket.SOCK_STREAM
+        ) as sock:
+            sock.settimeout(timeout)
+            sock.connect(str(path))
+            sock.sendall((command + "\n").encode())
+
+            chunks = []
+
+            while True:
+                block = sock.recv(65536)
+                if not block:
+                    break
+                chunks.append(block)
+
+            return b"".join(chunks).decode(
+                errors="replace"
+            )
+
+    except Exception:
+        return None
+
+
+def status_from_worker(job):
+    raw = local_worker_query(job, "STATUS")
+
+    if not raw:
+        return None
+
+    fields = raw.strip().split("\t")
+
+    try:
+        if len(fields) >= 9 and fields[0] == "STATUS":
+            return {
+                "metadata": fields[1] == "1",
+                "progress": float(fields[2]),
+            }
+    except Exception:
+        pass
+
+    return None
+
+
+
+
+
+
+
+
+
+
+def magnet_key(magnet: str) -> str:
+    try:
+        q = parse_qs(urlparse(magnet).query)
+        xt = (q.get("xt") or [""])[0]
+        if xt.lower().startswith("urn:btih:"):
+            return xt.rsplit(":", 1)[-1].upper()
+    except Exception:
+        pass
+    return magnet.casefold()
+
+
+def result_key(r) -> tuple:
+    if str(r.uri).startswith("magnet:"):
+        key = magnet_key(str(r.uri))
+        return ("btih", key)
+    return ("title-size", str(r.title).casefold().strip(), int(r.size or 0))
+
+
+TORZNAB_CAPS_CACHE=(
+    Path.home()
+    / ".cache"
+    / "torrent-get"
+    / "torznab-caps.json"
+)
+
+
+def parse_search_intent(query):
+    """
+    Foreground grammar remains ordinary torrent-get search text.
+
+    Recognized structural TV forms:
+
+      s22
+      s22e03
+      s22x03
+
+    Everything else remains lexical search text.
+    """
+
+    text=str(query or "").strip()
+
+    episode=re.search(
+        r"(?i)(?<![a-z0-9])s(\d{1,3})(?:e|x)(\d{1,3})(?![a-z0-9])",
+        text,
+    )
+
+    if episode:
+        season=int(episode.group(1))
+        ep=int(episode.group(2))
+
+        title=(
+            text[:episode.start()]
+            + " "
+            + text[episode.end():]
+        )
+
+        title=" ".join(title.split())
+
+        return {
+            "kind":"episode",
+            "query":text,
+            "title":title,
+            "season":season,
+            "episode":ep,
+        }
+
+    season_match=re.search(
+        r"(?i)(?<![a-z0-9])s(\d{1,3})(?![a-z0-9])",
+        text,
+    )
+
+    if season_match:
+        season=int(season_match.group(1))
+
+        title=(
+            text[:season_match.start()]
+            + " "
+            + text[season_match.end():]
+        )
+
+        title=" ".join(title.split())
+
+        return {
+            "kind":"season",
+            "query":text,
+            "title":title,
+            "season":season,
+            "episode":None,
+        }
+
+    return {
+        "kind":"general",
+        "query":text,
+        "title":text,
+        "season":None,
+        "episode":None,
+    }
+
+
+def _load_torznab_caps():
+    try:
+        data=json.loads(
+            TORZNAB_CAPS_CACHE.read_text()
+        )
+
+        if not isinstance(data,dict):
+            return {}
+
+        return data.get("indexers",{})
+
+    except Exception:
+        return {}
+
+
+def _indexer_tv_capable(caps,indexer_id,intent):
+    record=caps.get(
+        str(indexer_id),
+        {}
+    )
+
+    params={
+        str(x).casefold()
+        for x in record.get(
+            "tvsearch_params",
+            []
+        )
+    }
+
+    if not record.get("tvsearch"):
+        return False
+
+    # q + season are required for our structured TV grammar.
+    if not {"q","season"}.issubset(params):
+        return False
+
+    if (
+        intent.get("episode") is not None
+        and "ep" not in params
+    ):
+        return False
+
+    return True
+
+
+def _torznab_parse_results(ms,data,indexer_name):
+    root=ET.fromstring(data)
+
+    results=[]
+
+    for item in root.findall(".//item"):
+        attrs=ms.attr_map(item)
+        uri=ms.pick_uri(item,attrs)
+
+        if not uri:
+            continue
+
+        title=ms.text(item,"title") or "(untitled)"
+
+        try:
+            size=int(
+                attrs.get("size")
+                or ms.text(item,"size")
+                or 0
+            )
+        except Exception:
+            size=0
+
+        def as_int(key):
+            try:
+                return int(
+                    attrs.get(key,"0")
+                    or 0
+                )
+            except Exception:
+                return 0
+
+        source=(
+            ms.text(item,"jackettindexer")
+            or indexer_name
+        )
+
+        pubdate=ms.text(
+            item,
+            "pubDate",
+        )
+
+        results.append(
+            ms.Result(
+                title=title,
+                size=size,
+                seeders=as_int("seeders"),
+                peers=as_int("peers"),
+                source=source,
+                uri=uri,
+                age=ms.format_torrent_age(
+                    pubdate
+                ),
+            )
+        )
+
+    return results
+
+
+def _torznab_search_one(
+    ms,
+    base,
+    api_key,
+    indexer_id,
+    indexer_name,
+    intent,
+    caps,
+):
+    """
+    One network request per indexer, same as the established search.
+
+    Structured TV search is used only when cached capabilities prove
+    that the indexer supports the required Torznab parameters.
+    Otherwise the established general t=search path is retained.
+    """
+
+    if (
+        intent["kind"] == "episode"
+        and _indexer_tv_capable(
+            caps,
+            indexer_id,
+            intent,
+        )
+    ):
+        params={
+            "apikey":api_key,
+            "t":"tvsearch",
+            "q":intent["title"],
+            "season":str(intent["season"]),
+            "limit":str(
+                getattr(
+                    ms,
+                    "PER_INDEXER_LIMIT",
+                    100,
+                )
+            ),
+        }
+
+        if intent["episode"] is not None:
+            params["ep"]=str(
+                intent["episode"]
+            )
+
+        encoded=urllib.parse.urlencode(
+            params
+        )
+
+        url=(
+            f"{base}/api/v2.0/indexers/"
+            f"{urllib.parse.quote(str(indexer_id),safe='')}"
+            f"/results/torznab/api?{encoded}"
+        )
+
+        data=ms.request_bytes(
+            url,
+            timeout=ms.PER_INDEXER_TIMEOUT,
+        )
+
+        return (
+            indexer_name,
+            _torznab_parse_results(
+                ms,
+                data,
+                indexer_name,
+            ),
+        )
+
+    # Existing path — no behavioral change for ordinary searches or
+    # indexers without adequate tvsearch support.
+    return ms.search_one(
+        base,
+        api_key,
+        indexer_id,
+        indexer_name,
+        intent["query"].casefold(),
+    )
+
+
+def _tv_title_matches(title,intent):
+    """
+    Local structural certification remains mandatory even after a
+    Torznab tvsearch. Indexers vary in how tightly they honor fields.
+
+    Structured-TV lexical comparison uses torrent-release
+    normalization:
+
+      You're Killing Me
+      You’re Killing Me
+      Youre.Killing.Me
+
+    all become:
+
+      youre killing me
+
+    Apostrophes disappear inside words rather than becoming word
+    boundaries.
+
+    The requested series title must also begin the release title.
+    This prevents another show's episode subtitle from satisfying
+    the series-title test.
+    """
+
+    def canonical_title(value):
+        text=str(value or "").casefold()
+
+        # Apostrophe-like characters are normally omitted by torrent
+        # release naming. Remove them without creating whitespace.
+        text=text.translate(
+            str.maketrans(
+                "",
+                "",
+                "'’‘ʼ＇"
+            )
+        )
+
+        # Release punctuation/separators become ordinary boundaries.
+        return " ".join(
+            re.findall(
+                r"[a-z0-9]+",
+                text,
+            )
+        )
+
+    normalized=canonical_title(title)
+    title_phrase=canonical_title(
+        intent.get("title")
+    )
+
+    if title_phrase:
+        # Series identity is title-oriented. A subtitle belonging to
+        # another program must not qualify merely because it contains
+        # the requested words later in the release name.
+        if not (
+            normalized == title_phrase
+            or normalized.startswith(
+                title_phrase + " "
+            )
+        ):
+            return False
+
+    season=int(intent["season"])
+
+    if intent["episode"] is None:
+        structural_patterns=[
+            # A season request means membership in that season:
+            # full-season pack OR any episode in that season.
+            rf"(?i)(?<![a-z0-9])s0*{season}(?:e\d{{1,3}}|x\d{{1,3}})?(?![a-z0-9])",
+            rf"(?i)(?<![a-z0-9])season[\s._-]*0*{season}(?![a-z0-9])",
+            rf"(?i)(?<![a-z0-9])series[\s._-]*0*{season}(?![a-z0-9])",
+        ]
+    else:
+        episode=int(intent["episode"])
+
+        structural_patterns=[
+            rf"(?i)(?<![a-z0-9])s0*{season}e0*{episode}(?![a-z0-9])",
+            rf"(?i)(?<![a-z0-9])s0*{season}x0*{episode}(?![a-z0-9])",
+        ]
+
+    raw_title=str(title or "")
+
+    return any(
+        re.search(pattern,raw_title)
+        for pattern in structural_patterns
+    )
+
+
+
+def apply_torrent_get_relevance_gate(rows,query):
+    """
+    Unified local relevance policy.
+
+    general one word:
+        broad discovery unchanged
+
+    general multiword:
+        all query terms required, any order
+
+    structured TV:
+        title phrase + exact season/episode structure
+    """
+
+    intent=parse_search_intent(query)
+
+    if intent["kind"] in {"season","episode"}:
+        return [
+            row
+            for row in rows
+            if _tv_title_matches(
+                getattr(row,"title",""),
+                intent,
+            )
+        ]
+
+    required_terms=re.findall(
+        r"[a-z0-9]+",
+        str(query or "").casefold(),
+    )
+
+    if len(required_terms)<2:
+        return rows
+
+    narrowed=[]
+
+    for row in rows:
+        title_terms=set(
+            re.findall(
+                r"[a-z0-9]+",
+                str(
+                    getattr(row,"title","")
+                    or ""
+                ).casefold(),
+            )
+        )
+
+        if all(
+            term in title_terms
+            for term in required_terms
+        ):
+            narrowed.append(row)
+
+    return narrowed
+
+
+def discover(ms, query: str):
+    intent=parse_search_intent(query)
+
+    base,api_key=ms.load_jackett()
+
+    print(
+        "Discovering configured Jackett indexers..."
+    )
+
+    indexers=ms.discover_indexers(
+        base,
+        api_key,
+    )
+
+    print(
+        f"Searching {len(indexers)} indexer(s) in parallel; "
+        f"{ms.PER_INDEXER_TIMEOUT}s ceiling each."
+    )
+
+    caps=_load_torznab_caps()
+
+    collected=[]
+    failures=[]
+
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=min(
+            12,
+            max(1,len(indexers)),
+        )
+    ) as pool:
+
+        fmap={
+            pool.submit(
+                _torznab_search_one,
+                ms,
+                base,
+                api_key,
+                idx,
+                name,
+                intent,
+                caps,
+            ):name
+            for idx,name in indexers
+        }
+
+        for future in concurrent.futures.as_completed(
+            fmap
+        ):
+            name=fmap[future]
+
+            try:
+                _,rows=future.result()
+                collected.extend(rows)
+
+                print(
+                    f"  {name}: {len(rows)} result(s)"
+                )
+
+            except Exception as exc:
+                failures.append(name)
+
+                print(
+                    f"  {name}: skipped "
+                    f"({type(exc).__name__})"
+                )
+
+    unique={}
+
+    for row in collected:
+        key=result_key(row)
+        prev=unique.get(key)
+
+        if (
+            prev is None
+            or row.seeders>prev.seeders
+        ):
+            unique[key]=row
+
+    rows=sorted(
+        unique.values(),
+        key=lambda r:(
+            r.seeders,
+            r.peers,
+            r.size,
+        ),
+        reverse=True,
+    )
+
+    return rows,failures
+
+
+
+def draw(
+    ms,
+    rows,
+    queued: set[int],
+    failures,
+    history,
+    start_index=0,
+):
+    print()
+
+    # Operator-first display:
+    # # -> Name -> Size -> Seeds -> Source -> Status -> Media
+    #
+    # Only the active Search page is passed here. start_index preserves
+    # absolute result numbering across pages.
+    source_width = max(
+        len("Source"),
+        min(
+            18,
+            max(
+                (len(str(getattr(r, "source", "") or "..."))
+                 for r in rows),
+                default=len("Source"),
+            ),
+        ),
+    )
+
+    rendered = []
+
+    for i, r in enumerate(rows, start_index + 1):
+        title = r.title if len(r.title) <= 64 else r.title[:61] + "..."
+
+        media = infer_media(r)
+
+        status = (
+            "[QUEUED]"
+            if i in queued
+            else ""
+        )
+
+        rendered.append(
+            (
+                i,
+                title,
+                ms.human_size(r.size),
+                r.seeders,
+                str(r.source or "...")[:source_width],
+                status,
+                media,
+            )
+        )
+
+    status_width = max(
+        len("Status"),
+        max((len(x[5]) for x in rendered), default=len("Status")),
+    )
+
+    print(
+        f"{'#':>3}  "
+        f"{'Name':<64}  "
+        f"{'Size':>10}  "
+        f"{'Seeds':>6}  "
+        f"{'Source':<{source_width}}  "
+        f"{'Status':<{status_width}}  "
+        f"Media"
+    )
+
+    width = (
+        3 + 2 + 64 + 2 + 10 + 2 + 6 + 2
+        + source_width + 2 + status_width + 2 + 11
+    )
+    print("-" * width)
+
+    for i, title, size, seeds, source, status, media in rendered:
+        print(
+            f"{i:>3}  "
+            f"{title:<64}  "
+            f"{size:>10}  "
+            f"{seeds:>6}  "
+            f"{source:<{source_width}}  "
+            f"{status:<{status_width}}  "
+            f"{media[:11]}"
+        )
+
+    if failures:
+        print()
+        print(
+            f"Partial results: "
+            f"{len(failures)} indexer(s) timed out or failed."
+        )
+
+
+def expand_result(ms, result, number: int):
+    uri=str(getattr(result, 'uri', '') or '')
+    title=str(getattr(result, 'title', '') or '(untitled)')
+    source=str(getattr(result, 'source', '') or '...')
+    seeds=int(getattr(result, 'seeders', 0) or 0)
+    peers=int(getattr(result, 'peers', 0) or 0)
+    size=int(getattr(result, 'size', 0) or 0)
+    age=str(getattr(result, 'age', '') or '...')
+
+    infohash='...'
+    tracker_count=0
+    uri_type='URL'
+
+    if uri.startswith('magnet:'):
+        uri_type='Magnet'
+        try:
+            q=parse_qs(urlparse(uri).query)
+            xt=(q.get('xt') or [''])[0]
+            if xt.lower().startswith('urn:btih:'):
+                infohash=xt.rsplit(':',1)[-1].upper()
+            tracker_count=len(q.get('tr') or [])
+        except Exception:
+            pass
+
+    print()
+    print(f"Result [{number}] — {title}")
+    print(f"Source:      {source}")
+    print(f"Size:        {ms.human_size(size)}")
+    print(f"Seeds:       {seeds}")
+    print(f"Peers:       {peers}")
+    print(f"Age/Date:    {age}")
+    print(f"URI type:    {uri_type}")
+    print(f"Magnet #:    {infohash}")
+    print(f"Trackers:    {tracker_count if uri_type == 'Magnet' else '...'}")
+    print("NFO:         ...")
+    print()
+
+
+def resolve_for_queue(ms, uri: str) -> str:
+    uri=str(uri or '').strip()
+
+    if not uri:
+        raise RuntimeError('search result contains no acquisition URI')
+
+    # Already normalized.
+    if uri.startswith('magnet:?'):
+        return uri
+
+    if not uri.startswith(('http://','https://')):
+        raise RuntimeError(
+            f'unsupported discovery URI type: {uri[:40]}'
+        )
+
+    # URL resolution belongs to the Discovery Module.
+    print('Resolving indexer URL before queue submission...')
+
+    resolved=ms.resolve_to_magnet(uri)
+    resolved=str(resolved or '').strip()
+
+    # Hard module boundary:
+    # arbitrary URLs must never enter torrent-queue.
+    if not resolved.startswith('magnet:?'):
+        raise RuntimeError(
+            'indexer URL did not resolve to a usable magnet; '
+            'nothing was queued'
+        )
+
+    return resolved
+
+
+def parse_search_filter_terms(parts):
+    """
+    Split search operands into:
+      positive words -> one Jackett search query
+      -negative      -> local case-insensitive title exclusions
+
+    Example:
+      exhibitionist -porn -xxx
+        query    = "exhibitionist"
+        excludes = ["porn", "xxx"]
+    """
+    positive=[]
+    excludes=[]
+
+    for raw in parts:
+        term=str(raw).strip()
+
+        if not term:
+            continue
+
+        if term.startswith("-") and len(term) > 1:
+            excludes.append(term[1:].casefold())
+        else:
+            positive.append(term)
+
+    query=" ".join(positive).strip()
+
+    if not query:
+        raise ValueError(
+            "Search requires at least one positive search term."
+        )
+
+    return query, excludes
+
+
+def apply_phrase_relevance_gate(rows, query):
+    """
+    Unified torrent-get relevance gate.
+
+    Kept under the established function name so the existing
+    x=filtered accounting and operator review path remain unchanged.
+    """
+    return apply_torrent_get_relevance_gate(
+        rows,
+        query,
+    )
+
+
+def apply_episode_relevance_gate(rows, query):
+    """
+    Compatibility stage retained for the established search pipeline.
+
+    Relevance policy is now centralized in
+    apply_phrase_relevance_gate().
+    """
+    return rows
+
+
+
+
+def _automated_filtered_rows(before,after):
+    """
+    Derive only the rows removed by the existing automated
+    relevance gate.
+
+    No filtering decision is made here.
+    """
+    accepted={
+        id(row)
+        for row in after
+    }
+
+    return [
+        row
+        for row in before
+        if id(row) not in accepted
+    ]
+
+
+def _search_selection_prompt(filtered_rows):
+    """
+    Keep the normal Search prompt byte-for-byte equivalent when
+    no results were filtered.
+    """
+    if filtered_rows:
+        return (
+            "Select result number to queue, expand N for details, "
+            "x=filtered, or q: "
+        )
+
+    return (
+        "Select result number to queue, expand N for details, or q: "
+    )
+
+
+def _parse_numeric_selection(raw):
+    """Parse comma/whitespace-delimited numbers and inclusive ranges."""
+    text=re.sub(r'(?<=\d)\s*-\s*(?=\d)', '-', str(raw))
+    tokens=text.replace(',', ' ').split()
+    selected=[]
+
+    for token in tokens:
+        match=re.fullmatch(r'([0-9]+)(?:-([0-9]+))?', token)
+
+        if not match:
+            raise ValueError(f"invalid selection: {token}")
+
+        first=int(match.group(1))
+        last=int(match.group(2) or first)
+
+        if first<1 or last<first:
+            raise ValueError(f"invalid selection: {token}")
+
+        selected.extend(range(first,last+1))
+
+    if not selected:
+        raise ValueError("no selections")
+
+    return list(dict.fromkeys(selected))
+
+
+def _queue_search_rows(
+    ms,
+    source_rows,
+    selections,
+    queued,
+    resolved_keys,
+    history,
+):
+    """
+    Existing Search queue semantics shared by normal and explicitly
+    selected automated-filter results.
+    """
+    for n in selections:
+
+        if n in queued:
+            print(
+                f"Result {n} is already queued."
+            )
+            continue
+
+        selected=source_rows[n-1]
+
+        try:
+            magnet=resolve_for_queue(
+                ms,
+                selected.uri
+            )
+        except Exception as exc:
+            print(
+                f"Result {n}: unable to obtain magnet: {exc}"
+            )
+            continue
+
+        key=magnet_key(magnet)
+
+        if key in resolved_keys:
+            queued.add(n)
+
+            print(
+                f"Result {n} matches a torrent already queued "
+                "in this search session."
+            )
+            continue
+
+        cp=subprocess.run(
+            [
+                str(QUEUE),
+                "submit",
+                magnet,
+                "--save-path",
+                str(select_download_folder()),
+                "--origin",
+                str(getattr(selected, "source", "") or "..."),
+            ],
+            text=True,
+            capture_output=True,
+        )
+
+        if cp.stdout.strip():
+            print(
+                cp.stdout.strip()
+            )
+
+        if cp.returncode!=0:
+            error_text=cp.stderr.strip()
+
+            if (
+                "Global torrent network is PAUSED; "
+                "worker admission blocked."
+            ) in error_text:
+                print(
+                    "SYSTEM PAUSED — selection(s) not queued. "
+                    "Use: torrent-mgmnt resume"
+                )
+                return history
+
+            if error_text:
+                # Do not expose an internal Python traceback through
+                # the torrent-get operator interface.
+                lines=[
+                    line.strip()
+                    for line in error_text.splitlines()
+                    if line.strip()
+                ]
+
+                message=(
+                    lines[-1]
+                    if lines
+                    else "queue submission failed"
+                )
+
+                if ":" in message:
+                    prefix,tail=message.split(":",1)
+
+                    if prefix.endswith(
+                        (
+                            "RuntimeError",
+                            "ValueError",
+                            "OSError",
+                        )
+                    ):
+                        message=tail.strip()
+
+                print(
+                    f"Result {n}: queue submission failed — "
+                    f"{message}"
+                )
+
+            else:
+                print(
+                    f"Result {n}: queue submission failed."
+                )
+
+            continue
+
+        resolved_keys.add(key)
+        queued.add(n)
+
+    return history
+
+
+def _automated_filtered_view(
+    ms,
+    filtered_rows,
+    resolved_keys,
+    history,
+):
+    """
+    Transient review of rows hidden by relevance or explicit
+    negative-term filters.
+
+    This function is never called when filtered_rows is empty.
+    """
+    queued=set()
+
+    while True:
+        print()
+        print(
+            "torrent-get — Filtered Results"
+        )
+        print()
+
+        draw(
+            ms,
+            filtered_rows,
+            queued,
+            [],
+            history,
+        )
+
+        print()
+
+        choice=input(
+            "Select result number to queue, "
+            "expand N for details, b=back, q=quit: "
+        ).strip()
+
+        parts=choice.split()
+
+        if not parts:
+            continue
+
+        command=parts[0].casefold()
+
+        if command in {
+            "b",
+            "back",
+        }:
+            return "back",history,None
+
+        if command in {
+            "q",
+            "quit",
+            "exit",
+        }:
+            destination=(
+                parts[1]
+                if len(parts)==2
+                and parts[1].casefold()
+                in {"y","yes","n","no"}
+                else None
+            )
+
+            return "quit",history,destination
+
+        if command in {
+            "e",
+            "expand",
+        }:
+            if len(parts)!=2:
+                print(
+                    "Usage: expand N"
+                )
+                continue
+
+            try:
+                n=int(parts[1])
+            except ValueError:
+                print(
+                    "Usage: expand N"
+                )
+                continue
+
+            if not 1<=n<=len(filtered_rows):
+                print(
+                    "Invalid result number."
+                )
+                continue
+
+            expand_result(
+                ms,
+                filtered_rows[n-1],
+                n,
+            )
+
+            # Return to the same filtered result view after
+            # inspecting a result; no new search is performed.
+            draw(
+                ms,
+                filtered_rows,
+                queued,
+                [],
+                history,
+            )
+            continue
+
+        # Same numeric multi-selection convention as the normal
+        # Search result view.
+        try:
+            selections=_parse_numeric_selection(choice)
+        except ValueError:
+            print("Invalid result selection.")
+            continue
+
+        if not selections:
+            continue
+
+        invalid=[
+            n
+            for n in selections
+            if not 1<=n<=len(filtered_rows)
+        ]
+
+        if invalid:
+            print(
+                "Invalid result number(s): "
+                +" ".join(
+                    str(n)
+                    for n in invalid
+                )
+            )
+            continue
+
+        history=_queue_search_rows(
+            ms,
+            filtered_rows,
+            selections,
+            queued,
+            resolved_keys,
+            history,
+        )
+
+
+
+def search_session(ms, query: str, excludes=None):
+    print()
+    print('torrent-get — Search Module')
+    try:
+        rows, failures = discover(ms, query)
+    except Exception as exc:
+        print(f"Search failed: {exc}")
+        return
+
+    # Episode searches receive a strict local relevance gate.
+    # This adds no network work: it only narrows the candidate rows
+    # already returned by the configured indexers.
+    _automated_filter_input=list(rows)
+
+    rows=apply_episode_relevance_gate(
+        rows,
+        query
+    )
+
+    rows=apply_phrase_relevance_gate(
+        rows,
+        query
+    )
+
+    automated_filtered_rows=_automated_filtered_rows(
+        _automated_filter_input,
+        rows,
+    )
+
+    excludes=[
+        str(x).casefold()
+        for x in (excludes or [])
+        if str(x).strip()
+    ]
+
+    if excludes:
+        before=len(rows)
+
+        rows=[
+            row for row in rows
+            if not any(
+                term in str(
+                    getattr(row, "title", "") or ""
+                ).casefold()
+                for term in excludes
+            )
+        ]
+
+        removed=before-len(rows)
+
+        filter_status=(
+            f"[Filtered: {removed} excluded by "
+            + " ".join("-" + term for term in excludes)
+            + "]"
+        )
+
+    filtered_rows=_automated_filtered_rows(
+        _automated_filter_input,
+        rows,
+    )
+
+    if not rows and not filtered_rows:
+        if excludes:
+            print(filter_status)
+            print()
+
+        print(
+            "No usable results."
+        )
+        return
+
+    if not rows and filtered_rows:
+        if excludes:
+            print(filter_status)
+            print()
+
+        print(
+            "No default-visible results."
+        )
+
+    queued: set[int] = set()
+    resolved_keys: set[str] = set()
+
+    history = None
+
+    PAGE_SIZE=50
+    page=0
+
+    def draw_search_page():
+        if not rows:
+            return
+
+        page_count=max(
+            1,
+            (len(rows)+PAGE_SIZE-1)//PAGE_SIZE,
+        )
+
+        start=page*PAGE_SIZE
+        visible=rows[start:start+PAGE_SIZE]
+
+        draw(
+            ms,
+            visible,
+            queued,
+            failures,
+            history,
+            start_index=start,
+        )
+
+        if page_count > 1:
+            print()
+            print(
+                f"Page {page+1}/{page_count} "
+                f"— results {start+1}-{start+len(visible)} "
+                f"of {len(rows)}"
+            )
+            print("n=next page, p=previous page")
+
+    draw_search_page()
+
+    while True:
+        print()
+        if excludes:
+            print(filter_status)
+            print()
+        if automated_filtered_rows:
+            print(
+                "Automated filter: "
+                f"{len(automated_filtered_rows)} result(s) hidden"
+            )
+            print()
+
+        choice=input(
+            _search_selection_prompt(
+                filtered_rows
+            )
+        ).strip()
+
+        qparts=choice.strip().split()
+
+        if qparts and qparts[0].casefold() in {"q","quit","exit"}:
+            destination=(
+                qparts[1]
+                if len(qparts)==2
+                and qparts[1].casefold() in {"y","yes","n","no"}
+                else None
+            )
+
+            search_exit_handoff(destination)
+            return
+
+        lower=choice.casefold()
+
+        if lower in {"n","next"}:
+            page_count=max(
+                1,
+                (len(rows)+PAGE_SIZE-1)//PAGE_SIZE,
+            )
+
+            if page+1 < page_count:
+                page+=1
+
+            draw_search_page()
+            continue
+
+        if lower in {"p","prev","previous"}:
+            if page > 0:
+                page-=1
+
+            draw_search_page()
+            continue
+
+        if (
+            filtered_rows
+            and lower in {
+                "x",
+                "filtered",
+            }
+        ):
+            outcome,history,destination=_automated_filtered_view(
+                ms,
+                filtered_rows,
+                resolved_keys,
+                history,
+            )
+
+            if outcome=="quit":
+                search_exit_handoff(destination)
+                return
+
+            if rows:
+                draw_search_page()
+
+            continue
+
+        if lower.startswith("expand ") or lower.startswith("e "):
+            parts=choice.split()
+            if len(parts) != 2:
+                print("Usage: expand N")
+                continue
+            try:
+                n=int(parts[1])
+            except ValueError:
+                print("Usage: expand N")
+                continue
+            if not 1 <= n <= len(rows):
+                print("Invalid result number.")
+                continue
+            # Expand is a child view of the current search.
+            # Replace the search page instead of scrolling beneath it.
+            if sys.stdout.isatty():
+                print("\033[2J\033[H",end="")
+
+            # Expand is a child view of the current search.
+            # Replace the search page rather than adding to scrollback.
+            if sys.stdout.isatty():
+                print("\033[2J\033[H",end="")
+
+            expand_result(ms, rows[n - 1], n)
+
+            try:
+                action=input(
+                    "s=select, Enter=back: "
+                ).strip().casefold()
+            except (EOFError,KeyboardInterrupt):
+                print()
+                action=""
+
+            if action in {"s","select"}:
+                history=_queue_search_rows(
+                    ms,
+                    rows,
+                    [n],
+                    queued,
+                    resolved_keys,
+                    history,
+                )
+
+            if sys.stdout.isatty():
+                print("\033[2J\033[H",end="")
+
+            # Restore the exact current 50-record page.
+            # No new search is performed.
+            draw_search_page()
+            continue
+
+        # Preserve operator-entered order and collapse duplicate row
+        # numbers before performing any queue submission.
+        try:
+            selections=_parse_numeric_selection(choice)
+        except ValueError:
+            print("Invalid result selection.")
+            continue
+
+        if not selections:
+            continue
+
+        # Validate the complete selection before changing queue state.
+        invalid = [
+            n for n in selections
+            if not 1 <= n <= len(rows)
+        ]
+
+        if invalid:
+            print(
+                "Invalid result number(s): "
+                + " ".join(str(n) for n in invalid)
+            )
+            continue
+
+        history=_queue_search_rows(
+            ms,
+            rows,
+            selections,
+            queued,
+            resolved_keys,
+            history,
+        )
+
+        # One redraw after the complete operator selection has been
+        # processed. Preserve the operator's current search page.
+        draw_search_page()
+
+
+
+
+def select_download_folder():
+    """
+    Return the persistent operator-selected download directory.
+
+    Configuration authority belongs to torrent-mgmnt `con`.
+    No per-download prompt is permitted here.
+    """
+    import json
+    from pathlib import Path
+
+    default=Path.home() / "Downloads"
+    config=(
+        Path.home()
+        / ".local"
+        / "share"
+        / "torrent-get"
+        / "config.json"
+    )
+
+    try:
+        data=json.loads(config.read_text())
+        raw=str(data.get("download_folder","")).strip()
+        selected=Path(raw).expanduser()
+
+        if selected.is_absolute() and selected.is_dir():
+            return str(selected)
+
+    except Exception:
+        pass
+
+    return str(default)
+
+
+def search_exit_handoff(destination=None):
+    """
+    Search Module exit boundary.
+
+    Normal:
+      q -> ask whether to enter Torrent Management
+
+    Shortcut:
+      q y -> Torrent Management
+      q n -> Bash
+
+    Shortcut syntax is intentionally not advertised.
+    """
+
+    if destination is not None:
+        choice=str(destination).strip().casefold()
+    else:
+        print()
+
+        try:
+            choice=input(
+                "View Torrent Management? y/n: "
+            ).strip().casefold()
+        except (EOFError,KeyboardInterrupt):
+            print()
+            return
+
+    if choice in {"y","yes"}:
+        if not QUEUE.is_file() or not os.access(QUEUE,os.X_OK):
+            raise SystemExit(
+                f"torrent-mgmnt is not executable: {QUEUE}"
+            )
+        os.execv(str(QUEUE),[str(QUEUE)])
+
+    # n/no, blank, or anything else leaves Search.
+    return
+
+
+
+
+
+def _search_network_failure(exc):
+    """
+    True only for temporary network/Internet readiness failures.
+
+    Ordinary code, data, parsing, and programming failures continue
+    to raise normally.
+    """
+    import socket
+
+    if isinstance(
+        exc,
+        (
+            TimeoutError,
+            ConnectionError,
+            socket.timeout,
+            socket.gaierror,
+        ),
+    ):
+        return True
+
+    if isinstance(exc,OSError):
+        text=str(exc).casefold()
+
+        terms=(
+            "network is unreachable",
+            "network unreachable",
+            "no route to host",
+            "temporary failure in name resolution",
+            "name or service not known",
+            "connection refused",
+            "connection reset",
+            "connection aborted",
+            "timed out",
+            "timeout",
+        )
+
+        if any(term in text for term in terms):
+            return True
+
+    name=type(exc).__name__.casefold()
+
+    return name in {
+        "urlerror",
+        "connecttimeout",
+        "readtimeout",
+        "connectionerror",
+        "proxyerror",
+        "newconnectionerror",
+        "maxretryerror",
+    }
+
+
+def _search_session_softfail(*args,**kwargs):
+    """
+    Normal search_session with one operator-facing network soft fail.
+    """
+    try:
+        return search_session(
+            *args,
+            **kwargs,
+        )
+
+    except Exception as exc:
+        if not _search_network_failure(exc):
+            raise
+
+        print()
+        print(
+            "Internet not ready — search unavailable."
+        )
+        return None
+
+
+
+
+class ImportRejected(Exception):
+    """Expected operator/import rejection."""
+
+
+
+
+def _import_normalize_btih(value):
+    """
+    Normalize a BitTorrent v1 infohash to 40 uppercase hexadecimal
+    characters.
+
+    Accept:
+      40-character hexadecimal BTIH
+      32-character base32 BTIH
+    """
+    import base64
+    import re
+
+    value=str(value or "").strip()
+
+    if re.fullmatch(
+        r"[0-9A-Fa-f]{40}",
+        value,
+    ):
+        return value.upper()
+
+    if re.fullmatch(
+        r"[A-Za-z2-7]{32}",
+        value,
+    ):
+        try:
+            raw=base64.b32decode(
+                value.upper(),
+                casefold=True,
+            )
+        except Exception:
+            raise ImportRejected(
+                "magnet BTIH is invalid."
+            )
+
+        if len(raw)!=20:
+            raise ImportRejected(
+                "magnet BTIH is invalid."
+            )
+
+        return raw.hex().upper()
+
+    raise ImportRejected(
+        "magnet BTIH is invalid."
+    )
+
+
+def _import_parse_magnet(value):
+    """
+    Validate operator-supplied magnet input and return
+    (original_magnet, normalized_btih).
+    """
+    from urllib.parse import (
+        parse_qs,
+        urlparse,
+    )
+
+    value=str(value or "").strip()
+
+    if not value.startswith("magnet:?"):
+        raise ImportRejected(
+            "magnet URI is invalid."
+        )
+
+    try:
+        parsed=urlparse(value)
+        query=parse_qs(
+            parsed.query,
+            keep_blank_values=True,
+        )
+    except Exception:
+        raise ImportRejected(
+            "magnet URI is invalid."
+        )
+
+    xt_values=query.get("xt") or []
+
+    btih=None
+
+    for xt in xt_values:
+        text=str(xt or "").strip()
+
+        if text.casefold().startswith(
+            "urn:btih:"
+        ):
+            btih=text[9:]
+            break
+
+    if not btih:
+        raise ImportRejected(
+            "BTIH missing."
+        )
+
+    return (
+        value,
+        _import_normalize_btih(btih),
+    )
+
+
+
+
+def _import_submit(source):
+    """
+    Converge imported material on the existing queue/worker path.
+
+    No parallel downloader, worker, socket, daemon, or security
+    implementation is introduced here.
+    """
+    import subprocess
+
+    destination=select_download_folder()
+
+    command=[
+        str(QUEUE),
+        "submit",
+        str(source),
+        "--save-path",
+        str(destination),
+    ]
+
+    result=subprocess.run(
+        command
+    )
+
+    if result.returncode!=0:
+        raise ImportRejected(
+            "queue submission failed."
+        )
+
+    return destination
+
+
+
+
+
+
+
+
+def import_command(args):
+    """
+    torrent-get Import Module
+
+      torrent-get import
+      torrent-get import 'magnet:?xt=...'
+
+    Direct operator-supplied magnets bypass Search and enter the
+    established queue/worker security path.
+    """
+    args=list(args or [])
+
+    if len(args)>1:
+        print(
+            "Usage:\n"
+            "  torrent-get import\n"
+            "  torrent-get import 'magnet:?xt=...'"
+        )
+        return 2
+
+    command_line_import=bool(args)
+
+    if args:
+        raw=str(args[0]).strip()
+    else:
+        print()
+        print("torrent-get — Import Module")
+        print()
+
+        try:
+            raw=input("Paste magnet: ").strip()
+        except (EOFError,KeyboardInterrupt):
+            print()
+            return 0
+
+    print()
+    print(
+        "torrent-get — Import Module"
+    )
+
+    try:
+        if not raw.startswith("magnet:"):
+            raise ImportRejected(
+                "magnet URI required."
+            )
+
+        # Bash treats '&' as a command separator. An unquoted
+        # command-line magnet therefore commonly reaches us as
+        # only its initial xt= identity while dn=/tr= fields are
+        # launched separately by the shell.
+        #
+        # Interactive Paste magnet: input is not shell parsed and
+        # deliberately continues to accept a bare BTIH magnet.
+        if (
+            command_line_import
+            and raw.startswith("magnet:?")
+            and "&" not in raw
+            and raw.casefold().startswith(
+                "magnet:?xt=urn:btih:"
+            )
+        ):
+            raise ImportRejected(
+                "command-line magnet appears incomplete; "
+                "enclose the entire magnet URI in quotes."
+            )
+
+        magnet,infohash=_import_parse_magnet(
+            raw
+        )
+
+        destination=select_download_folder()
+
+        print(
+            "Type:        Magnet"
+        )
+        print(
+            f"Infohash:    {infohash}"
+        )
+        print(
+            "Source:      Operator import"
+        )
+        print(
+            "Destination:"
+        )
+        print(
+            f"  {destination}"
+        )
+        print()
+        print(
+            "Security:    existing Gatekeeper/worker path"
+        )
+        print()
+
+        _import_submit(
+            magnet
+        )
+
+        return 0
+
+    except ImportRejected as exc:
+        print()
+        print(
+            "Import rejected — "
+            +str(exc)
+        )
+        return 1
+
+
+def main():
+    # IMPORT MODULE GEN 1
+    if (
+        len(sys.argv)>=2
+        and sys.argv[1].casefold()=="import"
+    ):
+        return import_command(sys.argv[2:])
+
+    if not SEARCH.exists():
+        raise SystemExit(f"magnet-search missing: {SEARCH}")
+    if not QUEUE.exists():
+        raise SystemExit(f"torrent-mgmnt missing: {QUEUE}")
+
+    ms = load_search_module()
+
+    # One-line CLI mode: torrent-get search TERM
+    if len(sys.argv) > 1:
+        cmd = sys.argv[1].casefold()
+        if cmd == "search":
+            try:
+                query, excludes = parse_search_filter_terms(
+                    sys.argv[2:]
+                )
+            except ValueError as exc:
+                raise SystemExit(str(exc))
+
+            _search_session_softfail(
+                ms,
+                query,
+                excludes
+            )
+            return
+        if cmd in {"q", "quit", "exit"}:
+            return
+        if cmd in {"-h", "--help", "help"}:
+            print("Usage:\n  torrent-get                 interactive prompt\n  torrent-get search TERM     search immediately\n")
+            return
+        raise SystemExit(f"Unknown command: {' '.join(sys.argv[1:])}\nUse: torrent-get search TERM")
+
+    # Interactive mode: torrent-get
+    print("torrent-get\nDiscovery and submission module\n\nCommands:\n  search TERM\n  q\n")
+    while True:
+        try:
+            line = input("torrent-get> ").strip()
+        except EOFError:
+            print(); return
+        except KeyboardInterrupt:
+            print(); continue
+        if not line:
+            continue
+        if line.casefold() in {"q", "quit", "exit"}:
+            return
+        if line.startswith("search "):
+            parts=line.split()[1:]
+
+            try:
+                query, excludes = parse_search_filter_terms(
+                    parts
+                )
+            except ValueError as exc:
+                print(exc)
+                continue
+
+            _search_session_softfail(
+                ms,
+                query,
+                excludes
+            )
+            continue
+        print("Unknown command. Use: search TERM | q")
+
+
+if __name__ == "__main__":
+    main()

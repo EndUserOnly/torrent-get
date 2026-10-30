@@ -1,4 +1,4 @@
-# torrent-get 1.0
+# torrent-get
 
 `torrent-get` is a Linux command-line interface for libtorrent. It was built and tested on x86_64 Pop!_OS and compatible Ubuntu-family systems. Other systems are not certified.
 
@@ -16,7 +16,14 @@ This was a personal project that felt worthy to share.
 
 The torrent-get package itself does not change when optional GeoIP support is unavailable.
 
-## Download and verify
+## Current source update
+
+The recovery fix is packaged in [`releases/v1.0.1`](releases/v1.0.1).
+It preserves queue ownership and recovery artifacts, safely prunes
+inactive jobs, and reconciles global pause state. The original v1.0 package
+and download instructions below remain historical and unchanged.
+
+## Download and verify (original v1.0)
 
 Download the release archive, contents inventory, `SHA256SUMS`, and their `.sig` files from the GitHub release. Save the public key below as `torrent-get-release-key.pub`, then verify every detached signature and checksum:
 
